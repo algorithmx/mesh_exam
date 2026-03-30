@@ -60,8 +60,10 @@ class PyVistaAdapter(MeshAdapter):
         idx = 0
         while idx < len(faces):
             n_verts = int(faces[idx])
+            if n_verts <= 0:
+                break
             idx += 1
-            face_list.append(faces[idx:idx + n_verts])
+            face_list.append(list(faces[idx:idx + n_verts]))
             idx += n_verts
 
         return np.array(face_list)

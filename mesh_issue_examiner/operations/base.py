@@ -189,17 +189,7 @@ class OperationError(Exception):
     pass
 
 
-# Global registry instance (lazy initialization)
-_registry = None
-
-
-def get_registry() -> 'OperationRegistry':
-    """Get the global operation registry."""
-    global _registry
-    if _registry is None:
-        from operations.operation_registry import OperationRegistry
-        _registry = OperationRegistry()
-    return _registry
+from operations._registry import get_registry
 
 
 def register_operation(operation: BaseOperation) -> BaseOperation:

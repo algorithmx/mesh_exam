@@ -117,7 +117,9 @@ class QualityMetrics:
 
     def __post_init__(self):
         """Compute statistics from values array."""
-        if isinstance(self.values, list):
+        if self.values is None:
+            self.values = np.array([])
+        elif isinstance(self.values, list):
             self.values = np.array(self.values)
 
         if len(self.values) > 0:

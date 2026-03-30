@@ -228,6 +228,56 @@ class TestMeshIssueExaminerServer:
         assert resp.error["type"] == "ValueError"
         assert "no_such_mesh" in resp.error["message"]
 
+    def test_server_init_with_auto_register_does_not_raise(self):
+        """MeshIssueExaminerServer(auto_register_operations=True) must not raise.
+
+        Regression guard for Bug #5: before the fix, the constructor called
+        _register_operations which tried to register NonManifoldEdgeDetection
+        a second time, causing ValueError (not caught by except ImportError).
+        """
+        server = MeshIssueExaminerServer(auto_register_operations=True)
+        assert isinstance(server._mesh_cache, dict)
+
+    def test_server_tools_registered_after_auto_init(self):
+        """After init with auto_register, the 5 builtin MCP tools are available."""
+        server = MeshIssueExaminerServer(auto_register_operations=True)
+        tools = server.get_tools()
+        assert len(tools) == 5
+        names = {t["name"] for t in tools}
+        assert names == {
+            "mesh_load",
+            "mesh_inspect",
+            "mesh_get_result",
+            "mesh_clear_cache",
+            "list_operations",
+        }
+
+    def test_server_init_with_custom_config(self):
+        """Server should accept and store a custom OperationConfig."""
+        from core.models import OperationConfig
+        cfg = OperationConfig(tolerance=1e-10, parallel_enabled=False)
+        server = MeshIssueExaminerServer(
+            config=cfg,
+            auto_register_operations=False,
+        )
+        server._register_builtin_tools()
+        assert server.config is cfg
+        assert server.config.tolerance == 1e-10
+
+    def test_server_init_without_auto_register_has_no_tools(self):
+        """With auto_register_operations=False, no tools or ops are registered.
+
+        This verifies the constructor's behavior when the flag is False.
+        """
+        server = MeshIssueExaminerServer(auto_register_operations=False)
+        assert len(server._tools) == 0
+
+    def test_server_repr(self):
+        server = _make_server()
+        r = repr(server)
+        assert "MeshIssueExaminerServer" in r
+        assert "5 tools" in r
+
 
 # ---------------------------------------------------------------------------
 # Part 2: mcp/handlers.py

@@ -19,10 +19,10 @@ from core.models import (
     IssueCategory,
 )
 from operations.operation_registry import registry
-from adapters.trimesh_adapter import TrimeshAdapter
-from adapters.pyvista_adapter import PyVistaAdapter
-from adapters.pymeshlab_adapter import PyMeshLabAdapter
 from utils.mesh_loader import load_mesh_from_file
+
+# Ensure built-in operations are imported so they self-register at module level
+import operations.topological.nonmanifold_edges  # noqa: F401
 
 
 @dataclass
@@ -108,7 +108,6 @@ class MeshIssueExaminerServer:
 
         if auto_register_operations:
             self._register_builtin_tools()
-            self._register_operations()
 
     def _register_builtin_tools(self):
         """Register built-in MCP tools."""
@@ -220,15 +219,6 @@ class MeshIssueExaminerServer:
                 }
             }
         )
-
-    def _register_operations(self):
-        """Register built-in operations."""
-        # Import and register operations
-        try:
-            from operations.topological.nonmanifold_edges import NonManifoldEdgeDetection
-            registry.register(NonManifoldEdgeDetection())
-        except ImportError:
-            pass
 
     def get_tools(self) -> List[Dict[str, Any]]:
         """Get list of available tools."""

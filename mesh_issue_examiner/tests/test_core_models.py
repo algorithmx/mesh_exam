@@ -408,6 +408,62 @@ class TestQualityMetrics:
         )
         assert qm.violation_count == 0
 
+    def test_none_values_converted_to_empty_array(self):
+        """Passing values=None must not raise; it should become an empty array.
+
+        Regression guard for Bug #2: before the fix, QualityMetrics(values=None)
+        raised TypeError in __post_init__ because len(None) is invalid.
+        """
+        qm = QualityMetrics(
+            operation_id="op_q10",
+            metric_name="null_metric",
+            values=None,
+        )
+        assert isinstance(qm.values, np.ndarray)
+        assert len(qm.values) == 0
+
+    def test_none_values_no_statistics(self):
+        """When values is None, statistics stay empty and violation_count is 0."""
+        qm = QualityMetrics(
+            operation_id="op_q11",
+            metric_name="null_metric",
+            values=None,
+        )
+        assert qm.statistics == {}
+        assert qm.violation_count == 0
+
+    def test_empty_list_converted_to_empty_array(self):
+        """Empty list [] should become an empty ndarray with no statistics."""
+        qm = QualityMetrics(
+            operation_id="op_q12",
+            metric_name="empty_list",
+            values=[],
+        )
+        assert isinstance(qm.values, np.ndarray)
+        assert len(qm.values) == 0
+        assert qm.statistics == {}
+
+    def test_to_dict_with_empty_values(self):
+        """to_dict must work when values is empty (None → empty or [])."""
+        qm = QualityMetrics(
+            operation_id="op_q13",
+            metric_name="empty",
+            values=None,
+        )
+        d = qm.to_dict()
+        assert d["total_count"] == 0
+        assert "values" not in d
+
+    def test_threshold_with_empty_values_no_crash(self):
+        """Combining values=None with a threshold must not crash."""
+        qm = QualityMetrics(
+            operation_id="op_q14",
+            metric_name="edge_case",
+            values=None,
+            threshold=0.5,
+        )
+        assert qm.violation_count == 0
+
 
 # ---------------------------------------------------------------------------
 # InspectionResult
