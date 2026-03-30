@@ -21,6 +21,8 @@ FORMAT_SUPPORT = {
     '.vtp': ['pyvista'],
     '.vtk': ['pyvista'],
     '.3mf': ['trimesh'],
+    '.nas': ['trimesh', 'pyvista', 'pymeshlab'],
+    '.bdf': ['trimesh', 'pyvista', 'pymeshlab'],
 }
 
 
@@ -69,6 +71,25 @@ def load_mesh_from_file(
         supported = ', '.join(FORMAT_SUPPORT.keys())
         raise UnsupportedFormatError(
             f"Unsupported format: '{suffix}'. Supported formats: {supported}"
+        )
+
+    # NASTRAN formats: parse with custom parser, then build MeshInput directly
+    if suffix in ('.nas', '.bdf'):
+        from utils.nas_parser import parse_nas
+        try:
+            vertices, faces = parse_nas(str(file_path))
+        except Exception as e:
+            raise MeshLoadError(
+                f"Failed to parse NASTRAN file {file_path}: {e}"
+            ) from e
+
+        mesh_id = mesh_id or file_path.stem
+        return MeshInput(
+            vertices=vertices,
+            faces=faces,
+            mesh_id=mesh_id,
+            source_format='nas',
+            file_path=str(file_path)
         )
 
     # Determine library to use
