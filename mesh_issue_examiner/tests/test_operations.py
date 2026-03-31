@@ -5,8 +5,8 @@ Unit tests for mesh inspection operations.
 import pytest
 import numpy as np
 
-from core.models import MeshInput
-from operations.topological.nonmanifold_edges import NonManifoldEdgeDetection
+from mesh_issue_examiner.core.models import MeshInput
+from mesh_issue_examiner.operations.topological.nonmanifold_edges import NonManifoldEdgeDetection
 
 
 class TestNonManifoldEdgeDetection:
@@ -121,7 +121,7 @@ class TestCellQuality:
         mesh = MeshInput(vertices, faces)
 
         # Quality should be high (close to 1 for aspect ratio)
-        from operations.quality.cell_quality import CellQualityComputation
+        from mesh_issue_examiner.operations.quality.cell_quality import CellQualityComputation
         operation = CellQualityComputation(quality_types=['aspect_ratio'])
         issues = operation.execute(mesh)
 

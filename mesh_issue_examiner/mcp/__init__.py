@@ -2,8 +2,8 @@
 MCP server implementation for mesh issue examination.
 """
 
-from mcp.server import MeshIssueExaminerServer
-from mcp.tools import get_tool_definitions
+from .server import MeshIssueExaminerServer
+from .tools import get_tool_definitions
 
 __all__ = [
     "MeshIssueExaminerServer",

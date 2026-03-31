@@ -9,7 +9,7 @@ and MeshInput.
 import pytest
 import numpy as np
 
-from core.models import (
+from mesh_issue_examiner.core.models import (
     IssueSeverity,
     IssueCategory,
     Vertex,

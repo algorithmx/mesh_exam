@@ -5,29 +5,43 @@ This module provides the main server class that handles MCP protocol
 communications and routes requests to appropriate operations.
 """
 
-import asyncio
-import json
 import time
-from typing import Dict, List, Optional, Any, Callable, Union
-from dataclasses import dataclass, asdict
-from pathlib import Path
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass
 
-from core.models import (
+from ..core.models import (
     MeshInput,
     InspectionResult,
     OperationConfig,
     IssueCategory,
 )
-from operations.operation_registry import registry
-from utils.mesh_loader import load_mesh_from_file
+from ..operations.operation_registry import registry
+from ..utils.mesh_loader import load_mesh_from_file
 
 # Ensure built-in operations are imported so they self-register at module level
-import operations.topological.nonmanifold_edges  # noqa: F401
+from ..operations.topological import nonmanifold_edges as _  # noqa: F401
+from ..operations.quality import cell_quality as _  # noqa: F401
+from ..operations.volumetric import volume_cell_quality as _  # noqa: F401
+from ..operations.volumetric import geometric_validity as _  # noqa: F401
+from ..operations.volumetric import orientation_consistency as _  # noqa: F401
+from ..operations.volumetric import nonmanifold_faces as _  # noqa: F401
 
 
 @dataclass
 class MCPRequest:
-    """Represents an MCP protocol request."""
+    """Represents an MCP protocol request.
+    
+    The ``params`` field is intentionally typed as ``Dict[str, Any]`` to
+    accommodate varying parameter schemas for different MCP methods.
+    For type-safe access, validate parameters against the tool schemas
+    returned by ``list_operations`` before processing.
+    
+    Example:
+        >>> request = MCPRequest(
+        ...     method='mesh_load',
+        ...     params={'file_path': '/path/to/mesh.stl'}
+        ... )
+    """
     method: str
     params: Dict[str, Any]
     request_id: Optional[str] = None
@@ -377,3 +391,10 @@ class MeshIssueExaminerServer:
 
     def __repr__(self) -> str:
         return f"<MeshIssueExaminerServer: {len(self._tools)} tools, {len(self._mesh_cache)} cached meshes>"
+
+
+def main():
+    """Entry point for the mesh-examiner console command."""
+    server = MeshIssueExaminerServer()
+    print(f"Mesh Issue Examiner Server initialized: {server}")
+    return server

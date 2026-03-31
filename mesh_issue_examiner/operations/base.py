@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Any, Type, Callable
 import time
 
-from core.models import (
+from ..core.models import (
     MeshInput,
     MeshIssue,
     QualityMetrics,
@@ -97,13 +97,18 @@ class BaseOperation(ABC):
         """
         pass
 
-    def run(self, mesh: MeshInput) -> List[MeshIssue]:
+    def run(self, mesh: MeshInput, config: Optional[OperationConfig] = None) -> List[MeshIssue]:
         """
         Execute operation with timing and error handling.
 
         This method wraps execute() with timing and error handling,
         providing consistent behavior across all operations.
         """
+        original_config = self.config
+        original_caching = getattr(mesh, '_caching_enabled', True)
+        if config is not None:
+            self.config = config
+        mesh._caching_enabled = self.config.enable_caching
         start_time = time.perf_counter()
         self._execution_count += 1
 
@@ -117,6 +122,9 @@ class BaseOperation(ABC):
             raise OperationError(
                 f"Operation '{self.metadata.operation_id}' failed: {str(e)}"
             ) from e
+        finally:
+            mesh._caching_enabled = original_caching
+            self.config = original_config
 
     @property
     def statistics(self) -> Dict[str, Any]:
@@ -138,6 +146,17 @@ class QualityOperation(ABC):
 
     These operations return QualityMetrics instead of or in addition
     to MeshIssue objects.
+    
+    .. note::
+        Unlike ``BaseOperation``, this class does not provide a ``run()``
+        method with automatic exception handling. Subclasses should either:
+        
+        1. Implement their own error handling in ``compute()``
+        2. Use try/except blocks when calling library-specific code
+        3. Let exceptions propagate for the caller to handle
+        
+        This design allows quality operations to return partial results
+        or default values when specific metrics cannot be computed.
     """
 
     @property
@@ -156,6 +175,10 @@ class QualityOperation(ABC):
 
         Returns:
             QualityMetrics object with computed values
+            
+        Raises:
+            Exception: Subclasses may raise exceptions for unrecoverable errors.
+                Callers should handle exceptions appropriately.
         """
         pass
 
@@ -189,7 +212,7 @@ class OperationError(Exception):
     pass
 
 
-from operations._registry import get_registry
+from ._registry import get_registry
 
 
 def register_operation(operation: BaseOperation) -> BaseOperation:

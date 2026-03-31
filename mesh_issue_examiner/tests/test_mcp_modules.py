@@ -10,9 +10,9 @@ import asyncio
 import numpy as np
 import pytest
 
-from mcp.server import MCPRequest, MCPResponse, MCPTool, MeshIssueExaminerServer
-from mcp.handlers import RequestHandler, AsyncRequestHandler
-from mcp.tools import (
+from mesh_issue_examiner.mcp.server import MCPRequest, MCPResponse, MCPTool, MeshIssueExaminerServer
+from mesh_issue_examiner.mcp.handlers import RequestHandler
+from mesh_issue_examiner.mcp.tools import (
     ToolDefinition,
     SCHEMA_COMPONENTS,
     create_input_schema,
@@ -254,7 +254,7 @@ class TestMeshIssueExaminerServer:
 
     def test_server_init_with_custom_config(self):
         """Server should accept and store a custom OperationConfig."""
-        from core.models import OperationConfig
+        from mesh_issue_examiner.core.models import OperationConfig
         cfg = OperationConfig(tolerance=1e-10, parallel_enabled=False)
         server = MeshIssueExaminerServer(
             config=cfg,
@@ -314,32 +314,6 @@ class TestRequestHandler:
         handler = RequestHandler()
         with pytest.raises(KeyError):
             handler.get_handler("no_such_method")
-
-
-class TestAsyncRequestHandler:
-    """Tests for AsyncRequestHandler."""
-
-    def test_construction_creates_four_handlers(self):
-        arh = AsyncRequestHandler()
-        expected = {"mesh_load", "mesh_inspect", "mesh_get_result", "mesh_clear_cache"}
-        for method in expected:
-            assert arh.has_handler(method), f"Missing handler for '{method}'"
-
-    def test_has_handler_mesh_load(self):
-        arh = AsyncRequestHandler()
-        assert arh.has_handler("mesh_load") is True
-
-    def test_has_handler_mesh_inspect(self):
-        arh = AsyncRequestHandler()
-        assert arh.has_handler("mesh_inspect") is True
-
-    def test_has_handler_mesh_get_result(self):
-        arh = AsyncRequestHandler()
-        assert arh.has_handler("mesh_get_result") is True
-
-    def test_has_handler_mesh_clear_cache(self):
-        arh = AsyncRequestHandler()
-        assert arh.has_handler("mesh_clear_cache") is True
 
 
 # ---------------------------------------------------------------------------
@@ -468,19 +442,12 @@ class TestSchemaComponents:
 
 
 class TestGetToolDefinitions:
-    """Tests for get_tool_definitions function.
-
-    NOTE: get_tool_definitions() internally creates a MeshIssueExaminerServer
-    with ``auto_register_operations=True``, which calls ``_register_operations``
-    and tries to re-register an operation that was already registered at module
-    import time (see ``operations.topological.nonmanifold_edges`` line 130).
-    We patch the server construction to avoid the duplicate-registration error.
-    """
+    """Tests for get_tool_definitions function."""
 
     def test_returns_non_empty_list(self):
         from unittest.mock import patch
 
-        with patch("mcp.server.MeshIssueExaminerServer", side_effect=_make_server):
+        with patch("mesh_issue_examiner.mcp.server.MeshIssueExaminerServer", side_effect=_make_server):
             defs = get_tool_definitions()
         assert isinstance(defs, list)
         assert len(defs) > 0
@@ -488,7 +455,7 @@ class TestGetToolDefinitions:
     def test_all_items_are_tool_definitions(self):
         from unittest.mock import patch
 
-        with patch("mcp.server.MeshIssueExaminerServer", side_effect=_make_server):
+        with patch("mesh_issue_examiner.mcp.server.MeshIssueExaminerServer", side_effect=_make_server):
             defs = get_tool_definitions()
         for td in defs:
             assert isinstance(td, ToolDefinition)

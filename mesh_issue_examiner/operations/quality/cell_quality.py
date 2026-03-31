@@ -7,7 +7,7 @@ Computes various element shape quality metrics using PyVista/VTK.
 from typing import List, Dict, Optional, Any
 import numpy as np
 
-from core.models import (
+from ...core.models import (
     MeshInput,
     MeshIssue,
     QualityMetrics,
@@ -15,8 +15,8 @@ from core.models import (
     IssueSeverity,
     OperationConfig,
 )
-from operations.base import BaseOperation, OperationMetadata
-from operations.operation_registry import registry
+from ..base import BaseOperation, OperationMetadata
+from ..operation_registry import registry
 
 
 class CellQualityComputation(BaseOperation):
@@ -65,13 +65,13 @@ class CellQualityComputation(BaseOperation):
     def execute(self, mesh: MeshInput) -> List[MeshIssue]:
         """Execute cell quality computation."""
         try:
-            from adapters.pyvista_adapter import PyVistaAdapter
-            adapter = PyVistaAdapter()
+            from ...adapters.factory import get_adapter
+            adapter = get_adapter('pyvista')
             native_mesh = adapter.from_canonical(mesh)
         except ImportError:
             # Fallback to TRimesh
-            from adapters.trimesh_adapter import TrimeshAdapter
-            adapter = TrimeshAdapter()
+            from ...adapters.factory import get_adapter
+            adapter = get_adapter('trimesh')
             native_mesh = adapter.from_canonical(mesh)
 
         issues = []

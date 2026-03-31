@@ -2,10 +2,16 @@
 PyMeshLab library adapter implementation.
 """
 
+import logging
+import warnings
 from typing import Any, Dict, List, Tuple, Optional
+
 import numpy as np
 
-from adapters.base_adapter import MeshAdapter
+from .base_adapter import MeshAdapter
+from .exceptions import QualityMetricError, FileIOError, MeshConversionError
+
+logger = logging.getLogger(__name__)
 
 
 class PyMeshLabAdapter(MeshAdapter):
@@ -14,10 +20,52 @@ class PyMeshLabAdapter(MeshAdapter):
 
     PyMeshLab provides Python bindings for MeshLab's mesh processing
     capabilities, including many filters for mesh repair and analysis.
+    
+    **Capabilities:**
+    - Surface meshes: Full support with advanced filtering
+    - Volumetric meshes: Surface boundary extraction only
+    - File I/O: Many formats via MeshLab
+    - Quality metrics: Basic surface metrics
+    - Remeshing: Smoothing, decimation, subdivision
+    
+    **Limitations:**
+    - No native volumetric cell support (tet4, hex8, etc.)
+    - Volumetric meshes are processed as surface boundary only
+    - Thread-safety: Not thread-safe (instance state)
+
+    **Volumetric Mesh Handling:**
+    When given a volumetric mesh (with volume_cells), this adapter extracts
+    the surface boundary using PyVista and processes that surface.
+    
+    **Thread Safety:**
+    This adapter stores internal state (_current_meshset) and is NOT
+    thread-safe. Each thread should use its own adapter instance.
+    
+    Example:
+        >>> adapter = PyMeshLabAdapter()
+        >>> 
+        >>> # Surface mesh
+        >>> mesh = adapter.load_mesh('model.obj')
+        >>> adapter.smooth(mesh, n_iterations=10)
+        >>> 
+        >>> # Volumetric mesh - processes surface boundary
+        >>> surface = adapter.from_canonical(volumetric_mesh_input)
     """
 
     def __init__(self):
         self._current_meshset = None
+
+    @property
+    def capabilities(self) -> 'AdapterCapability':
+        """Return capabilities supported by PyMeshLab."""
+        from .capabilities import AdapterCapability
+        return (
+            AdapterCapability.SURFACE_MESH |
+            AdapterCapability.FILE_IO |
+            AdapterCapability.QUALITY_METRICS |
+            AdapterCapability.TOPOLOGY_CHECKS |
+            AdapterCapability.REMESHING
+        )
 
     @property
     def library_name(self) -> str:
@@ -28,16 +76,74 @@ class PyMeshLabAdapter(MeshAdapter):
         import pymeshlab
         return pymeshlab
 
+    def _is_volumetric_file(self, file_path: str) -> bool:
+        """Check if file likely contains volumetric data based on extension.
+        
+        Args:
+            file_path: Path to mesh file
+            
+        Returns:
+            True if file extension indicates volumetric format
+        """
+        volumetric_extensions = {'.vtu', '.vtk', '.cgns', '.exo', '.e', '.msh'}
+        ext = file_path.lower()
+        return any(ext.endswith(ve) for ve in volumetric_extensions)
+
     def load_mesh(self, file_path: str, **kwargs) -> 'pymeshlab.MeshSet':
-        """Load mesh from file using PyMeshLab."""
+        """Load mesh from file using PyMeshLab.
+        
+        Args:
+            file_path: Path to mesh file
+            **kwargs: Additional pymeshlab arguments
+            
+        Returns:
+            pymeshlab.MeshSet object
+            
+        Raises:
+            FileIOError: If file cannot be loaded
+            
+        Note:
+            For volumetric files (.vtu, .vtk, etc.), a warning is issued
+            that only the surface boundary will be processed.
+        """
         import pymeshlab as ml
-        ms = ml.MeshSet()
-        ms.load_new_mesh(file_path)
-        self._current_meshset = ms
-        return ms
+        from .exceptions import FileIOError
+        
+        try:
+            # Check if file likely contains volumetric data
+            if self._is_volumetric_file(file_path):
+                warnings.warn(
+                    f"File '{file_path}' appears to contain volumetric data. "
+                    f"PyMeshLab will process the surface boundary only. "
+                    f"For full volumetric support, use the PyVista adapter.",
+                    UserWarning,
+                    stacklevel=2
+                )
+                logger.info(
+                    "Loading volumetric file '%s' - surface boundary only",
+                    file_path
+                )
+            
+            ms = ml.MeshSet()
+            ms.load_new_mesh(file_path)
+            self._current_meshset = ms
+            return ms
+            
+        except Exception as e:
+            raise FileIOError(
+                f"PyMeshLab failed to load mesh from {file_path}: {e}"
+            ) from e
 
     def create_mesh(self, vertices: np.ndarray, faces: np.ndarray) -> 'pymeshlab.MeshSet':
-        """Create mesh from arrays."""
+        """Create mesh from arrays.
+        
+        Args:
+            vertices: Nx3 array of vertex coordinates
+            faces: Mx3 array of face indices
+            
+        Returns:
+            pymeshlab.MeshSet object
+        """
         import pymeshlab as ml
 
         mesh = ml.Mesh(
@@ -119,12 +225,28 @@ class PyMeshLabAdapter(MeshAdapter):
         meshset: 'pymeshlab.MeshSet',
         tolerance: float
     ) -> List[int]:
-        """Find duplicate vertices."""
+        """Find duplicate vertices.
+        
+        Args:
+            meshset: PyMeshLab MeshSet
+            tolerance: Distance threshold (note: PyMeshLab uses different units)
+            
+        Returns:
+            List of duplicate vertex indices (approximate)
+        """
         original_count = meshset.current_mesh().vertex_number()
 
         # Use PyMeshLab's merge close vertices
-        meshset.merge_close_vertices(threshold=tolerance)
-
+        # Note: PyMeshLab uses percentage of bounding box diagonal
+        # We convert absolute tolerance to approximate percentage
+        mesh = meshset.current_mesh()
+        bbox = mesh.bounding_box()
+        diagonal = np.linalg.norm(bbox.dim())
+        
+        if diagonal > 0:
+            threshold_pct = (tolerance / diagonal) * 100
+            meshset.merge_close_vertices(threshold=threshold_pct)
+        
         cleaned_count = meshset.current_mesh().vertex_number()
 
         # Return indices of vertices that were merged (approximate)
@@ -178,29 +300,206 @@ class PyMeshLabAdapter(MeshAdapter):
         meshset: 'pymeshlab.MeshSet',
         quality_type: str
     ) -> np.ndarray:
-        """Compute cell quality using PyMeshLab."""
-        # PyMeshLab has various quality computation capabilities
-        # This is a simplified implementation
+        """Compute cell quality using PyMeshLab.
+        
+        Supported quality types:
+        - 'area': Face area
+        - 'aspect_ratio': Ratio of longest to shortest edge
+        
+        Args:
+            meshset: PyMeshLab MeshSet
+            quality_type: Type of quality metric
+            
+        Returns:
+            Array of quality values
+            
+        Raises:
+            QualityMetricError: If quality type is not supported
+        """
+        try:
+            if quality_type == 'area':
+                return self.compute_face_areas(meshset)
 
-        if quality_type == 'area':
-            return self.compute_face_areas(meshset)
+            # For other metrics, fallback to manual computation
+            vertices = self.get_vertices(meshset)
+            faces = self.get_faces(meshset)
+            n_faces = len(faces)
 
-        # For other metrics, fallback to manual computation
-        vertices = self.get_vertices(meshset)
-        faces = self.get_faces(meshset)
-        n_faces = len(faces)
+            if quality_type == 'aspect_ratio':
+                aspect_ratios = []
+                for face in faces:
+                    v = vertices[face]
+                    edges = [
+                        np.linalg.norm(v[1] - v[0]),
+                        np.linalg.norm(v[2] - v[1]),
+                        np.linalg.norm(v[0] - v[2])
+                    ]
+                    # Simple aspect ratio approximation
+                    aspect_ratios.append(max(edges) / min(edges) if min(edges) > 0 else 0)
+                return np.array(aspect_ratios)
+            
+            raise QualityMetricError(
+                f"PyMeshLab does not support quality type: {quality_type}. "
+                f"Supported: area, aspect_ratio"
+            )
+            
+        except QualityMetricError:
+            raise
+        except Exception as e:
+            raise QualityMetricError(
+                f"Failed to compute {quality_type}: {e}"
+            ) from e
 
-        if quality_type == 'aspect_ratio':
-            aspect_ratios = []
-            for face in faces:
-                v = vertices[face]
-                edges = [
-                    np.linalg.norm(v[1] - v[0]),
-                    np.linalg.norm(v[2] - v[1]),
-                    np.linalg.norm(v[0] - v[2])
-                ]
-                # Simple aspect ratio approximation
-                aspect_ratios.append(max(edges) / min(edges) if min(edges) > 0 else 0)
-            return np.array(aspect_ratios)
+    def from_canonical(self, mesh_input: 'MeshInput') -> 'pymeshlab.MeshSet':
+        """Create PyMeshLab MeshSet from canonical format.
+        
+        For surface meshes (with faces), creates a MeshSet directly.
+        For volumetric meshes (with volume_cells), extracts the surface
+        boundary using PyVista and creates a MeshSet from that surface.
+        
+        Args:
+            mesh_input: MeshInput in canonical format
+            
+        Returns:
+            pymeshlab.MeshSet object (surface mesh)
+            
+        Note:
+            Volumetric meshes are converted to their surface boundary.
+            This is because PyMeshLab does not natively support volumetric
+            cells. Use PyVista adapter for full volumetric support.
+        """
+        if mesh_input.has_volume_cells:
+            logger.info(
+                "Volumetric mesh detected. Extracting surface boundary "
+                "for PyMeshLab (surface-focused library)."
+            )
+            return self._extract_surface_boundary(mesh_input)
+        
+        return self.create_mesh(mesh_input.vertices, mesh_input.faces)
 
-        return np.array([])
+    def _extract_surface_boundary(self, mesh_input: 'MeshInput') -> 'pymeshlab.MeshSet':
+        """Extract surface boundary from volumetric mesh.
+        
+        Uses PyVista to extract the surface boundary of a volumetric mesh,
+        then creates a MeshSet from that surface.
+        
+        Args:
+            mesh_input: MeshInput with volume_cells
+            
+        Returns:
+            pymeshlab.MeshSet of the surface boundary
+            
+        Raises:
+            MeshConversionError: If surface extraction fails
+        """
+        import pymeshlab as ml
+        
+        try:
+            # Use PyVista to get volumetric representation
+            grid = mesh_input.get_native('pyvista')
+            
+            # Extract surface
+            surface = grid.extract_surface()
+            
+            # Get vertices and faces
+            vertices = surface.points
+            faces_raw = surface.faces
+            
+            # Convert VTK face format to simple face array
+            face_list = []
+            if len(faces_raw) > 0:
+                idx = 0
+                while idx < len(faces_raw):
+                    n_verts = int(faces_raw[idx])
+                    if n_verts <= 0 or idx + 1 + n_verts > len(faces_raw):
+                        break
+                    idx += 1
+                    face_list.append(faces_raw[idx:idx + n_verts].tolist())
+                    idx += n_verts
+            
+            if not face_list:
+                raise ValueError("No faces extracted from volumetric mesh")
+            
+            # Create MeshSet from surface
+            mesh = ml.Mesh(
+                vertex_matrix=vertices.tolist(),
+                face_matrix=face_list
+            )
+            ms = ml.MeshSet()
+            ms.add_mesh(mesh)
+            self._current_meshset = ms
+            return ms
+            
+        except Exception as e:
+            raise MeshConversionError(
+                f"Failed to extract surface boundary from volumetric mesh: {e}. "
+                f"Ensure pyvista is installed for volumetric mesh support."
+            ) from e
+
+    # ======================================================================
+    # PyMeshLab-specific remeshing methods (not part of base interface)
+    # ======================================================================
+
+    def smooth(
+        self,
+        meshset: 'pymeshlab.MeshSet',
+        n_iterations: int = 3,
+        method: str = 'laplacian'
+    ) -> 'pymeshlab.MeshSet':
+        """Smooth mesh using Laplacian smoothing.
+        
+        Args:
+            meshset: MeshSet to smooth
+            n_iterations: Number of smoothing iterations
+            method: Smoothing method ('laplacian' or 'taubin')
+            
+        Returns:
+            Smoothed MeshSet (modifies in place)
+        """
+        if method == 'laplacian':
+            meshset.laplacian_smooth(stepsmoothnum=n_iterations)
+        elif method == 'taubin':
+            meshset.taubin_smooth(stepsmoothnum=n_iterations)
+        else:
+            raise ValueError(f"Unknown smoothing method: {method}")
+        return meshset
+
+    def decimate(
+        self,
+        meshset: 'pymeshlab.MeshSet',
+        target_reduction: float = 0.5
+    ) -> 'pymeshlab.MeshSet':
+        """Simplify mesh by reducing face count.
+        
+        Args:
+            meshset: MeshSet to decimate
+            target_reduction: Target reduction factor (0-1)
+            
+        Returns:
+            Decimated MeshSet (modifies in place)
+        """
+        meshset.simplification_quadric_edge_collapse_decimation(
+            targetperc=target_reduction
+        )
+        return meshset
+
+    def repair(self, meshset: 'pymeshlab.MeshSet') -> 'pymeshlab.MeshSet':
+        """Apply various mesh repair filters.
+        
+        This applies a standard repair sequence:
+        1. Remove duplicate vertices
+        2. Remove unreferenced vertices
+        3. Remove duplicate faces
+        4. Remove zero-area faces
+        
+        Args:
+            meshset: MeshSet to repair
+            
+        Returns:
+            Repaired MeshSet (modifies in place)
+        """
+        meshset.merge_close_vertices()
+        meshset.remove_unreferenced_vertices()
+        meshset.remove_duplicate_faces()
+        meshset.remove_zero_area_faces()
+        return meshset

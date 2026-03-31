@@ -5,10 +5,10 @@ Quality metric utilities and threshold definitions.
 from typing import Dict, List, Optional, Any, Tuple
 import numpy as np
 
-from core.models import MeshInput, QualityMetrics, IssueSeverity
+from ..core.models import MeshInput, QualityMetrics, IssueSeverity
 
 
-# Default quality thresholds
+# Default quality thresholds (surface)
 DEFAULT_THRESHOLDS = {
     'aspect_ratio': 0.3,
     'skewness': 0.5,
@@ -21,15 +21,39 @@ DEFAULT_THRESHOLDS = {
     'area': 1e-10,
 }
 
+# Volumetric (3D) element quality thresholds
+VOLUMETRIC_THRESHOLDS = {
+    'scaled_jacobian': 0.1,    # <=0 invalid, <0.1 poor
+    'volume': 1e-12,           # near-zero = degenerate
+    'aspect_ratio': 0.1,      # VTK convention (1=ideal, 0=degenerate)
+    'condition': 100.0,       # Condition number (lower = better)
+    'skewness': 0.8,          # Equiangular skewness (>0.8 = poor)
+    'orthogonality': 0.15,    # Face normal orthogonality
+    'shape': 0.3,             # Shape metric (1=ideal)
+    'distortion': 0.5,        # Distortion metric (1=ideal)
+    'radius_ratio': 3.0,      # Radius ratio (1=ideal)
+    'collapse_ratio': 0.1,    # Collapse ratio
+    'degenerate_volume': 1e-12,  # Threshold for degenerate cell detection
+    'sliver_ratio': 1e-6,     # Volume / max_edge^3 ratio for sliver detection
+}
+
 
 def get_default_thresholds() -> Dict[str, float]:
     """Get default thresholds for all quality metrics."""
     return DEFAULT_THRESHOLDS.copy()
 
 
+def get_volumetric_thresholds() -> Dict[str, float]:
+    """Get default thresholds for volumetric (3D) quality metrics."""
+    return VOLUMETRIC_THRESHOLDS.copy()
+
+
 def get_threshold(metric_name: str) -> float:
     """Get default threshold for a specific metric."""
-    return DEFAULT_THRESHOLDS.get(metric_name, 0.1)
+    return DEFAULT_THRESHOLDS.get(
+        metric_name,
+        VOLUMETRIC_THRESHOLDS.get(metric_name, 0.1)
+    )
 
 
 def compute_all_quality_metrics(
@@ -96,7 +120,7 @@ def compute_violation_stats(
     Returns:
         Dictionary with violation statistics
     """
-    total_elements = sum(len(m.total_count) if hasattr(m, 'total_count') else len(m.values) for m in metrics_list)
+    total_elements = sum(len(m.values) for m in metrics_list)
     total_violations = sum(m.violation_count for m in metrics_list)
 
     by_metric = {}

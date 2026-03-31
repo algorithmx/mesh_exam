@@ -33,7 +33,7 @@ def get_tool_definitions() -> List[ToolDefinition]:
     Returns:
         List of ToolDefinition objects
     """
-    from mcp.server import MeshIssueExaminerServer
+    from .server import MeshIssueExaminerServer
 
     server = MeshIssueExaminerServer()
 

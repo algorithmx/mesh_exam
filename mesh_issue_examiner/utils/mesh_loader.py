@@ -6,23 +6,80 @@ from pathlib import Path
 from typing import Optional, Union, Dict, Any
 import numpy as np
 
-from core.models import MeshInput
-from core.exceptions import MeshLoadError, UnsupportedFormatError
+from ..core.models import MeshInput
+from ..core.exceptions import MeshLoadError, UnsupportedFormatError
 
 
 # Format to library support mapping
+# Libraries are listed in order of preference (first = preferred)
 FORMAT_SUPPORT = {
-    '.stl': ['trimesh', 'pyvista', 'pymeshlab'],
-    '.obj': ['trimesh', 'pyvista', 'pymeshlab'],
-    '.ply': ['trimesh', 'pyvista', 'pymeshlab'],
-    '.off': ['trimesh', 'pymeshlab'],
+    # Common surface formats
+    '.stl': ['trimesh', 'pyvista', 'pymeshlab', 'meshio'],
+    '.obj': ['trimesh', 'pyvista', 'pymeshlab', 'meshio'],
+    '.ply': ['trimesh', 'pyvista', 'pymeshlab', 'meshio'],
+    '.off': ['trimesh', 'pymeshlab', 'meshio'],
     '.gltf': ['trimesh', 'pyvista'],
     '.glb': ['trimesh', 'pyvista'],
-    '.vtp': ['pyvista'],
-    '.vtk': ['pyvista'],
-    '.3mf': ['trimesh'],
-    '.nas': ['trimesh', 'pyvista', 'pymeshlab'],
-    '.bdf': ['trimesh', 'pyvista', 'pymeshlab'],
+    
+    # VTK formats (volumetric support)
+    '.vtp': ['pyvista', 'meshio'],
+    '.vtk': ['pyvista', 'meshio', 'vedo'],
+    '.vtu': ['pyvista', 'meshio', 'vedo'],
+    
+    # 3MF
+    '.3mf': ['trimesh', 'meshio'],
+    
+    # NASTRAN formats
+    '.nas': ['trimesh', 'pyvista', 'pymeshlab', 'meshio'],
+    '.bdf': ['trimesh', 'pyvista', 'pymeshlab', 'meshio'],
+    '.fem': ['meshio'],  # NASTRAN alternative extension
+    
+    # Gmsh formats
+    '.msh': ['meshio', 'pyvista'],  # Gmsh native format
+    
+    # Abaqus
+    '.inp': ['meshio'],
+    
+    # ANSYS
+    '.ans': ['meshio'],
+    
+    # Exodus (parallel HDF5 format)
+    '.e': ['meshio'],
+    '.exo': ['meshio'],
+    
+    # XDMF (FEM standard)
+    '.xdmf': ['meshio'],
+    '.xmf': ['meshio'],
+    
+    # MED/Salome
+    '.med': ['meshio'],
+    
+    # CGNS (CFD format)
+    '.cgns': ['meshio'],
+    
+    # FLAC3D
+    '.f3grid': ['meshio'],
+    
+    # TetGen
+    '.node': ['meshio'],
+    '.ele': ['meshio'],
+    
+    # Medit
+    '.mesh': ['meshio'],
+    '.meshb': ['meshio'],
+    
+    # SU2
+    '.su2': ['meshio'],
+    
+    # UGRID
+    '.ugrid': ['meshio'],
+    
+    # Tecplot
+    '.dat': ['meshio'],
+    
+    # PERMAS
+    '.post': ['meshio'],
+    '.dato': ['meshio'],
 }
 
 
@@ -40,6 +97,7 @@ def load_mesh_from_file(
     file_path: Union[str, Path],
     mesh_id: Optional[str] = None,
     library: Optional[str] = None,
+    extract_volume_cells: bool = True,
     **kwargs
 ) -> MeshInput:
     """
@@ -48,12 +106,14 @@ def load_mesh_from_file(
     Args:
         file_path: Path to mesh file
         mesh_id: Optional mesh identifier
-        library: Preferred library ('trimesh', 'pyvista', 'pymeshlab')
+        library: Preferred library ('trimesh', 'pyvista', 'pymeshlab', 'meshio', 'vedo')
                 If None, first available library is used
+        extract_volume_cells: If True, extract volumetric cells for 3D meshes
+                (requires meshio for best support)
         **kwargs: Additional library-specific arguments
 
     Returns:
-        MeshInput in canonical format
+        MeshInput in canonical format (with volume_cells populated for 3D meshes)
 
     Raises:
         FileNotFoundError: If file does not exist
@@ -75,7 +135,7 @@ def load_mesh_from_file(
 
     # NASTRAN formats: parse with custom parser, then build MeshInput directly
     if suffix in ('.nas', '.bdf'):
-        from utils.nas_parser import parse_nas
+        from .nas_parser import parse_nas
         try:
             vertices, faces = parse_nas(str(file_path))
         except Exception as e:
@@ -123,7 +183,22 @@ def load_mesh_from_file(
 
     # Load using selected library
     try:
-        adapter = _get_adapter(selected_library)
+        from ..adapters.factory import get_adapter
+        adapter = get_adapter(selected_library)
+
+        # Special handling for meshio to extract volumetric cells
+        if selected_library == 'meshio' and extract_volume_cells:
+            meshio_adapter = adapter
+            native_mesh = meshio_adapter.load_mesh(str(file_path), **kwargs)
+            mesh_input = meshio_adapter.to_canonical(
+                native_mesh,
+                mesh_id=mesh_id or file_path.stem
+            )
+            mesh_input.file_path = str(file_path)
+            mesh_input.source_format = suffix[1:]
+            return mesh_input
+
+        # Standard loading for other libraries
         native_mesh = adapter.load_mesh(str(file_path), **kwargs)
         vertices = adapter.get_vertices(native_mesh)
         faces = adapter.get_faces(native_mesh)
@@ -193,6 +268,7 @@ def save_mesh_to_file(
         mesh: MeshInput in canonical format
         file_path: Output file path
         library: Library to use (default: auto-detect from extension)
+                Use 'meshio' for best volumetric mesh support
         **kwargs: Additional library-specific arguments
     """
     file_path = Path(file_path)
@@ -200,34 +276,36 @@ def save_mesh_to_file(
 
     if library is None:
         if suffix not in FORMAT_SUPPORT:
-            library = 'trimesh'  # Fallback
+            # For unsupported formats, try meshio first (most capable)
+            if _is_library_available('meshio'):
+                library = 'meshio'
+            else:
+                library = 'pyvista'  # Fallback
         else:
-            library = FORMAT_SUPPORT[suffix][0]
+            # Prefer meshio for formats that support volumetric data
+            libs = FORMAT_SUPPORT[suffix]
+            if 'meshio' in libs and _is_library_available('meshio'):
+                library = 'meshio'
+            else:
+                library = libs[0]
 
-    adapter = _get_adapter(library)
-    native_mesh = adapter.from_canonical(mesh)
-    native_mesh.save(str(file_path), **kwargs)
+    from ..adapters.factory import get_adapter
+    adapter = get_adapter(library)
+
+    # Special handling for meshio adapter's save method
+    if library == 'meshio':
+        native_mesh = adapter.from_canonical(mesh)
+        adapter.save_mesh(native_mesh, str(file_path), **kwargs)
+    else:
+        native_mesh = adapter.from_canonical(mesh)
+        native_mesh.save(str(file_path), **kwargs)
 
 
 def _is_library_available(library: str) -> bool:
     """Check if a library is installed."""
     try:
-        _get_adapter(library)
+        from ..adapters.factory import get_adapter
+        get_adapter(library)
         return True
     except ImportError:
         return False
-
-
-def _get_adapter(library: str):
-    """Get adapter instance for library."""
-    if library == 'trimesh':
-        from adapters.trimesh_adapter import TrimeshAdapter
-        return TrimeshAdapter()
-    elif library == 'pyvista':
-        from adapters.pyvista_adapter import PyVistaAdapter
-        return PyVistaAdapter()
-    elif library == 'pymeshlab':
-        from adapters.pymeshlab_adapter import PyMeshLabAdapter
-        return PyMeshLabAdapter()
-    else:
-        raise ValueError(f"Unknown library: {library}")

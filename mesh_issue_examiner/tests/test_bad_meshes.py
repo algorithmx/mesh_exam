@@ -9,10 +9,10 @@ are correctly detected and reported.
 import pytest
 import numpy as np
 
-from core.models import MeshInput, MeshIssue, IssueCategory, IssueSeverity
-from operations.topological.nonmanifold_edges import NonManifoldEdgeDetection
-from operations.quality.cell_quality import CellQualityComputation
-from operations.operation_registry import OperationRegistry
+from mesh_issue_examiner.core.models import MeshInput, MeshIssue, IssueCategory, IssueSeverity
+from mesh_issue_examiner.operations.topological.nonmanifold_edges import NonManifoldEdgeDetection
+from mesh_issue_examiner.operations.quality.cell_quality import CellQualityComputation
+from mesh_issue_examiner.operations.operation_registry import OperationRegistry
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +525,7 @@ class TestFullWorkflow:
 
     def test_full_workflow_detects_issues(self):
         """Full workflow should return an InspectionResult with issues."""
-        from core.models import InspectionResult
+        from mesh_issue_examiner.core.models import InspectionResult
 
         mesh = self._make_bad_mesh()
         reg = _make_registry()
@@ -694,8 +694,9 @@ class TestRegistryListing:
         assert 'topology.detect_nonmanifold_edges' not in reg
         assert len(reg) == 1
 
-    def test_register_duplicate_raises(self):
-        """Registering the same operation twice should raise ValueError."""
+    def test_register_duplicate_is_idempotent(self):
+        """Registering the same operation twice is idempotent (no error)."""
         reg = _make_registry()
-        with pytest.raises(ValueError, match="already registered"):
-            reg.register(NonManifoldEdgeDetection())
+        original_len = len(reg)
+        reg.register(NonManifoldEdgeDetection())
+        assert len(reg) == original_len

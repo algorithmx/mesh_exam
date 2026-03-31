@@ -33,6 +33,14 @@ class IssueCategory(Enum):
     ORIENTATION = "orientation"
 
 
+class MeshDimensionality(Enum):
+    """Classification of mesh spatial dimensionality."""
+    PURE_2D = "pure_2d"
+    SURFACE_2D = "surface_2d"
+    VOLUMETRIC_3D = "volumetric_3d"
+    MIXED_2D_3D = "mixed_2d_3d"
+
+
 @dataclass
 class Vertex:
     """Represents a 3D vertex."""
@@ -110,7 +118,7 @@ class QualityMetrics:
     """Container for mesh quality metrics."""
     operation_id: str
     metric_name: str
-    values: Union[np.ndarray, List[float]]
+    values: Optional[Union[np.ndarray, List[float]]]
     statistics: Dict[str, float] = field(default_factory=dict)
     threshold: Optional[float] = None
     violation_count: int = 0
@@ -234,7 +242,8 @@ class MeshInput:
     Canonical mesh representation for MCP operations.
 
     Wraps library-specific mesh objects for transparent interchange
-    between different mesh processing libraries.
+    between different mesh processing libraries. Supports both surface
+    meshes (faces) and volumetric meshes (volume_cells).
     """
 
     def __init__(
@@ -243,7 +252,8 @@ class MeshInput:
         faces: Union[np.ndarray, List[List[int]]],
         mesh_id: str = "",
         source_format: str = "",
-        file_path: Optional[str] = None
+        file_path: Optional[str] = None,
+        volume_cells: Optional[Dict[str, Union[np.ndarray, List[List[int]]]]] = None
     ):
         self.mesh_id = mesh_id or f"mesh_{id(self)}"
         self.file_path = file_path
@@ -256,10 +266,17 @@ class MeshInput:
         self._native_objects: Dict[str, Any] = {}
         self._adjacency_cache: Dict[str, Any] = {}
 
+        # Volume cells: dict mapping element type name -> NxK connectivity array
+        self._volume_cells: Dict[str, np.ndarray] = {}
+        if volume_cells is not None:
+            for etype, arr in volume_cells.items():
+                converted = np.array(arr) if not isinstance(arr, np.ndarray) else arr
+                self._volume_cells[etype] = converted
+
     @property
     def vertices(self) -> np.ndarray:
-        """Get vertex array."""
-        return self._vertices
+        """Get vertex array (copy to prevent cache invalidation bypass)."""
+        return self._vertices.copy()
 
     @vertices.setter
     def vertices(self, value: np.ndarray):
@@ -269,8 +286,8 @@ class MeshInput:
 
     @property
     def faces(self) -> np.ndarray:
-        """Get face array."""
-        return self._faces
+        """Get face array (copy to prevent cache invalidation bypass)."""
+        return self._faces.copy()
 
     @faces.setter
     def faces(self, value: np.ndarray):
@@ -287,6 +304,43 @@ class MeshInput:
     def n_faces(self) -> int:
         """Number of faces."""
         return len(self._faces)
+
+    @property
+    def volume_cells(self) -> Dict[str, np.ndarray]:
+        """Get volume cells dict (element_type -> connectivity array).
+
+        Returns a deep copy to prevent cache invalidation bypass. Modifying
+        the returned dict or its arrays will NOT affect the mesh. To update
+        volume cells, use the setter: ``mesh.volume_cells = new_dict``.
+        """
+        return {k: v.copy() for k, v in self._volume_cells.items()}
+
+    @volume_cells.setter
+    def volume_cells(self, value: Optional[Dict[str, Union[np.ndarray, List[List[int]]]]]):
+        """Set volume cells and invalidate cache."""
+        if value is None:
+            self._volume_cells = {}
+        else:
+            self._volume_cells = {
+                k: np.array(v) if not isinstance(v, np.ndarray) else v
+                for k, v in value.items()
+            }
+        self.invalidate_cache()
+
+    @property
+    def n_volume_cells(self) -> int:
+        """Total number of volume cells across all element types."""
+        return sum(len(arr) for arr in self._volume_cells.values())
+
+    @property
+    def has_volume_cells(self) -> bool:
+        """True if mesh contains volumetric cells."""
+        return len(self._volume_cells) > 0
+
+    @property
+    def cell_types(self) -> List[str]:
+        """List of element type names present in the mesh."""
+        return list(self._volume_cells.keys())
 
     @property
     def bounding_box(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -306,50 +360,29 @@ class MeshInput:
         return max_b - min_b
 
     def get_native(self, library: str) -> Any:
-        """Get library-specific mesh object, constructing if needed."""
-        if library not in self._native_objects:
-            self._construct_native(library)
-        return self._native_objects[library]
+        """Get library-specific mesh object, constructing if needed.
+        
+        .. note::
+            This method is not thread-safe. If multiple threads call
+            ``get_native()`` simultaneously for the same library,
+            ``_construct_native()`` may be called multiple times.
+            For thread-safe usage, external synchronization is required.
+        """
+        caching = getattr(self, '_caching_enabled', True)
+        if caching:
+            if library not in self._native_objects:
+                self._construct_native(library)
+            return self._native_objects[library]
+        # Bypass cache: construct fresh object without storing it
+        from ..adapters.factory import get_adapter
+        adapter = get_adapter(library)
+        return adapter.from_canonical(self)
 
     def _construct_native(self, library: str):
-        """Construct library-specific mesh object."""
-        if library == 'trimesh':
-            try:
-                import trimesh
-                self._native_objects['trimesh'] = trimesh.Trimesh(
-                    vertices=self._vertices,
-                    faces=self._faces
-                )
-            except ImportError:
-                raise ImportError("TRimesh not installed. Install with: pip install trimesh")
-
-        elif library == 'pyvista':
-            try:
-                import pyvista as pv
-                n_faces = len(self._faces)
-                face_arr = np.column_stack([
-                    np.full(n_faces, 3, dtype=np.int32),
-                    self._faces
-                ]).ravel()
-                self._native_objects['pyvista'] = pv.PolyData(self._vertices, face_arr)
-            except ImportError:
-                raise ImportError("PyVista not installed. Install with: pip install pyvista")
-
-        elif library == 'pymeshlab':
-            try:
-                import pymeshlab as pml
-                mesh = pml.Mesh(
-                    vertex_matrix=self._vertices.tolist(),
-                    face_matrix=self._faces.tolist()
-                )
-                ms = pml.MeshSet()
-                ms.add_mesh(mesh)
-                self._native_objects['pymeshlab'] = ms
-            except ImportError:
-                raise ImportError("PyMeshLab not installed. Install with: pip install pymeshlab")
-
-        else:
-            raise ValueError(f"Unsupported library: {library}")
+        """Construct library-specific mesh object via the adapter factory."""
+        from ..adapters.factory import get_adapter
+        adapter = get_adapter(library)
+        self._native_objects[library] = adapter.from_canonical(self)
 
     def invalidate_cache(self):
         """Clear cached data when mesh is modified."""
@@ -358,17 +391,19 @@ class MeshInput:
 
     def copy(self) -> 'MeshInput':
         """Create a deep copy of this mesh."""
+        vc_copy = {k: v.copy() for k, v in self._volume_cells.items()} if self._volume_cells else None
         return MeshInput(
             vertices=self._vertices.copy(),
             faces=self._faces.copy(),
             mesh_id=f"{self.mesh_id}_copy",
             source_format=self.source_format,
-            file_path=self.file_path
+            file_path=self.file_path,
+            volume_cells=vc_copy
         )
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary representation."""
-        return {
+        result = {
             'mesh_id': self.mesh_id,
             'source_format': self.source_format,
             'file_path': self.file_path,
@@ -379,3 +414,7 @@ class MeshInput:
                 'max': self.bounding_box[1].tolist()
             }
         }
+        if self.has_volume_cells:
+            result['n_volume_cells'] = self.n_volume_cells
+            result['cell_types'] = self.cell_types
+        return result

@@ -8,7 +8,7 @@ the 2-manifold property required for valid solid models.
 from typing import List, Optional
 import numpy as np
 
-from core.models import (
+from ...core.models import (
     MeshInput,
     MeshIssue,
     IssueLocation,
@@ -16,8 +16,9 @@ from core.models import (
     IssueSeverity,
     OperationConfig,
 )
-from operations.base import BaseOperation, OperationMetadata
-from operations.operation_registry import registry
+from ..base import BaseOperation, OperationMetadata
+from ..operation_registry import registry
+from ...utils.metrics import determine_severity
 
 
 class NonManifoldEdgeDetection(BaseOperation):
@@ -79,14 +80,8 @@ class NonManifoldEdgeDetection(BaseOperation):
             ))
 
         # Determine severity based on extent
-        severity = IssueSeverity.ERROR
         violation_rate = len(nonmanifold_edges) / max(len(mesh.faces), 1)
-        if violation_rate > 0.1:
-            severity = IssueSeverity.CRITICAL
-        elif violation_rate > 0.01:
-            severity = IssueSeverity.ERROR
-        elif violation_rate > 0.001:
-            severity = IssueSeverity.WARNING
+        severity = determine_severity(violation_rate)
 
         issue = MeshIssue(
             operation_id=self.metadata.operation_id,
@@ -111,14 +106,40 @@ class NonManifoldEdgeDetection(BaseOperation):
 
     def _build_edge_face_map(self, mesh: MeshInput) -> dict:
         """Build mapping from edges to incident faces."""
-        edge_faces = {}
+        faces = mesh.faces
+        n_faces = len(faces)
+        if n_faces == 0:
+            return {}
 
-        for face_idx, face in enumerate(mesh.faces):
+        # Vectorized fast path for triangular meshes
+        n_verts_per_face = faces.shape[1] if faces.ndim == 2 else None
+
+        if n_verts_per_face == 3:
+            edge_v1 = np.concatenate([faces[:, 0], faces[:, 1], faces[:, 0]])
+            edge_v2 = np.concatenate([faces[:, 1], faces[:, 2], faces[:, 2]])
+            face_indices = np.concatenate([
+                np.arange(n_faces), np.arange(n_faces), np.arange(n_faces)
+            ])
+
+            edges_min = np.minimum(edge_v1, edge_v2)
+            edges_max = np.maximum(edge_v1, edge_v2)
+
+            edge_faces = {}
+            for i in range(len(edges_min)):
+                edge = (int(edges_min[i]), int(edges_max[i]))
+                if edge not in edge_faces:
+                    edge_faces[edge] = []
+                edge_faces[edge].append(int(face_indices[i]))
+
+            return edge_faces
+
+        # Fallback for polygonal faces
+        edge_faces = {}
+        for face_idx, face in enumerate(faces):
             n = len(face)
             for i in range(n):
                 v1, v2 = int(face[i]), int(face[(i + 1) % n])
                 edge = (min(v1, v2), max(v1, v2))
-
                 if edge not in edge_faces:
                     edge_faces[edge] = []
                 edge_faces[edge].append(face_idx)

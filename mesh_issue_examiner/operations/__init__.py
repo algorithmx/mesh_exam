@@ -2,7 +2,7 @@
 Base classes for mesh inspection operations.
 """
 
-from operations.base import (
+from .base import (
     BaseOperation,
     QualityOperation,
     OperationMetadata,

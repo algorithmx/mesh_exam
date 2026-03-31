@@ -8,14 +8,14 @@ from typing import Dict, List, Type, Optional, Callable, Any
 from dataclasses import dataclass, field
 from collections import defaultdict
 
-from core.models import (
+from ..core.models import (
     MeshInput,
     InspectionResult,
     IssueCategory,
     IssueSeverity,
     OperationConfig,
 )
-from operations.base import BaseOperation, OperationMetadata
+from .base import BaseOperation, OperationMetadata
 
 
 @dataclass
@@ -94,9 +94,9 @@ class OperationRegistry:
         op_id = operation.metadata.operation_id
         category = operation.metadata.category
 
-        # Validate operation has unique ID
+        # Skip duplicate registrations silently (idempotent)
         if op_id in self._operations:
-            raise ValueError(f"Operation with ID '{op_id}' already registered")
+            return self
 
         # Register in main dictionary
         self._operations[op_id] = operation
@@ -178,8 +178,6 @@ class OperationRegistry:
             op = self.get(oid)
             if op is None:
                 raise ValueError(f"Unknown operation: {oid}")
-            if config is not None:
-                op.config = config
             operations.append(op)
 
         def workflow(mesh: MeshInput) -> InspectionResult:
@@ -193,7 +191,7 @@ class OperationRegistry:
             start_time = time.perf_counter()
 
             for operation in operations:
-                issues = operation.run(mesh)
+                issues = operation.run(mesh, config=config)
                 result.issues.extend(issues)
 
             result.processing_time = time.perf_counter() - start_time

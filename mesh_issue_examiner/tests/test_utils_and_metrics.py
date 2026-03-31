@@ -7,7 +7,7 @@ Uses ONLY numpy (no trimesh/pyvista/pymeshlab).
 import pytest
 import numpy as np
 
-from utils.metrics import (
+from mesh_issue_examiner.utils.metrics import (
     DEFAULT_THRESHOLDS,
     get_default_thresholds,
     get_threshold,
@@ -15,15 +15,14 @@ from utils.metrics import (
     compute_all_quality_metrics,
     compute_violation_stats,
 )
-from utils.mesh_loader import (
+from mesh_issue_examiner.utils.mesh_loader import (
     FORMAT_SUPPORT,
     get_supported_formats,
     is_format_supported,
     create_mesh_from_arrays,
-    _get_adapter,
     _is_library_available,
 )
-from core.models import MeshInput, QualityMetrics, IssueSeverity
+from mesh_issue_examiner.core.models import MeshInput, QualityMetrics, IssueSeverity
 
 
 # ---------------------------------------------------------------------------
@@ -309,28 +308,52 @@ class TestComputeViolationStats:
 class TestFormatSupport:
     """Tests for FORMAT_SUPPORT constant."""
 
-    EXPECTED_EXTENSIONS = {
+    # Core extensions that must be present
+    CORE_EXTENSIONS = {
         '.stl', '.obj', '.ply', '.off', '.gltf', '.glb', '.vtp', '.vtk', '.3mf',
+        '.nas', '.bdf', '.vtu',
     }
 
-    def test_all_expected_extensions_exist(self):
-        """All documented format extensions must be present."""
-        for ext in self.EXPECTED_EXTENSIONS:
+    # Extended formats added via meshio support
+    MESHIO_EXTENSIONS = {
+        '.msh', '.inp', '.e', '.exo', '.xdmf', '.xmf', '.med', '.cgns',
+        '.f3grid', '.node', '.ele', '.mesh', '.meshb', '.su2', '.ugrid',
+        '.dat', '.post', '.dato', '.fem', '.ans',
+    }
+
+    def test_all_core_extensions_exist(self):
+        """All core format extensions must be present."""
+        for ext in self.CORE_EXTENSIONS:
             assert ext in FORMAT_SUPPORT, f"Missing extension: {ext}"
 
-    def test_no_extra_extensions(self):
-        """FORMAT_SUPPORT should contain exactly the documented extensions."""
-        assert set(FORMAT_SUPPORT.keys()) == self.EXPECTED_EXTENSIONS
+    def test_meshio_extensions_available(self):
+        """Extended meshio formats should be available."""
+        for ext in self.MESHIO_EXTENSIONS:
+            assert ext in FORMAT_SUPPORT, f"Missing meshio extension: {ext}"
+            assert 'meshio' in FORMAT_SUPPORT[ext], f"{ext} should support meshio"
 
-    def test_stl_supports_trimesh_and_pyvista(self):
-        """.stl must list at least trimesh and pyvista."""
+    def test_stl_supports_trimesh_pyvista_and_meshio(self):
+        """.stl must list at least trimesh, pyvista, and meshio."""
         libs = FORMAT_SUPPORT['.stl']
         assert 'trimesh' in libs
         assert 'pyvista' in libs
+        assert 'meshio' in libs
 
-    def test_vtp_supports_pyvista_only(self):
-        """.vtp must list only pyvista."""
-        assert FORMAT_SUPPORT['.vtp'] == ['pyvista']
+    def test_vtp_supports_pyvista_and_meshio(self):
+        """.vtp must support pyvista and meshio."""
+        libs = FORMAT_SUPPORT['.vtp']
+        assert 'pyvista' in libs
+        assert 'meshio' in libs
+
+    def test_volumetric_formats_support_meshio(self):
+        """Volumetric formats (.vtu, .vtk) should support meshio."""
+        assert 'meshio' in FORMAT_SUPPORT['.vtu']
+        assert 'meshio' in FORMAT_SUPPORT['.vtk']
+
+    def test_gmsh_format_supported(self):
+        """Gmsh .msh format should be supported via meshio."""
+        assert '.msh' in FORMAT_SUPPORT
+        assert 'meshio' in FORMAT_SUPPORT['.msh']
 
 
 class TestGetSupportedFormats:
@@ -410,15 +433,6 @@ class TestCreateMeshFromArrays:
         assert isinstance(mesh, MeshInput)
 
 
-class TestGetAdapter:
-    """Tests for _get_adapter(library)."""
-
-    def test_unknown_library_raises_value_error(self):
-        """An unrecognized library name must raise ValueError."""
-        with pytest.raises(ValueError, match="Unknown library"):
-            _get_adapter('not_a_real_lib')
-
-
 class TestIsLibraryAvailable:
     """Tests for _is_library_available(library)."""
 
@@ -432,9 +446,9 @@ class TestIsLibraryAvailable:
 
     def test_unknown_library_raises_value_error(self):
         """
-        _get_adapter raises ValueError (not ImportError) for unknown libraries,
+        get_adapter raises ValueError (not ImportError) for unknown libraries,
         so _is_library_available does NOT catch it and ValueError propagates.
         This is the observed behaviour.
         """
-        with pytest.raises(ValueError, match="Unknown library"):
+        with pytest.raises(ValueError, match="Unsupported library"):
             _is_library_available('totally_fake_library')

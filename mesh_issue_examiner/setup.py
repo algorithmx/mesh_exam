@@ -56,7 +56,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "mesh-examiner=mcp.server:main",
+            "mesh-examiner=mesh_issue_examiner.mcp.server:main",
         ],
     },
 )

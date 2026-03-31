@@ -8,7 +8,7 @@ module-level registry functions, OperationCategory, and OperationRegistry.
 import pytest
 import numpy as np
 
-from core.models import (
+from mesh_issue_examiner.core.models import (
     MeshInput,
     MeshIssue,
     QualityMetrics,
@@ -17,7 +17,7 @@ from core.models import (
     OperationConfig,
     InspectionResult,
 )
-from operations.base import (
+from mesh_issue_examiner.operations.base import (
     BaseOperation,
     OperationMetadata,
     QualityOperation,
@@ -26,7 +26,7 @@ from operations.base import (
     register_operation,
     _register_decorator,
 )
-from operations.operation_registry import OperationRegistry, OperationCategory
+from mesh_issue_examiner.operations.operation_registry import OperationRegistry, OperationCategory
 
 
 # ---------------------------------------------------------------------------
@@ -425,13 +425,13 @@ class TestOperationRegistryFresh:
 
     # -- 3. Register duplicate ID raises ValueError --
 
-    def test_register_duplicate_raises(self):
+    def test_register_duplicate_is_idempotent(self):
         reg = self._fresh_registry()
         op1 = MockOperation(op_id="dup.id")
         op2 = MockOperation(op_id="dup.id")
         reg.register(op1)
-        with pytest.raises(ValueError, match="already registered"):
-            reg.register(op2)
+        reg.register(op2)  # idempotent: should not raise
+        assert len(reg) == 1
 
     # -- 4. Unregister existing returns True --
 
@@ -656,10 +656,12 @@ class TestOperationRegistryFresh:
         reg = self._fresh_registry()
         op = MockOperation(op_id="wf.cfg")
         reg.register(op)
+        original_cfg = op.config
         cfg = OperationConfig(tolerance=0.5)
         wf = reg.create_workflow(["wf.cfg"], config=cfg)
-        # The operation's config should have been updated
-        assert op.config is cfg
+        # The workflow should be created without mutating the singleton's config
+        assert wf is not None
+        assert op.config is original_cfg
 
     def test_register_method_chaining(self):
         reg = self._fresh_registry()

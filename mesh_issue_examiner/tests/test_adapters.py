@@ -17,8 +17,8 @@ the broader class of "adapter silently corrupts data on edge-case input."
 import numpy as np
 import pytest
 
-from adapters.pyvista_adapter import PyVistaAdapter
-from adapters.base_adapter import MeshAdapter
+from mesh_issue_examiner.adapters.pyvista_adapter import PyVistaAdapter
+from mesh_issue_examiner.adapters.base_adapter import MeshAdapter
 
 
 # ---------------------------------------------------------------------------
@@ -142,18 +142,18 @@ class TestPyVistaGetFacesMalformedInput:
         faces = self.adapter.get_faces(mesh)
         assert faces.shape[0] == 1
 
-    def test_truncated_face_array_raises(self):
-        """If the array ends mid-face, get_faces raises ValueError.
+    def test_truncated_face_array_handled_gracefully(self):
+        """If the array ends mid-face, get_faces stops cleanly.
 
         The n_verts count says 3 but only 1 vertex follows before the
-        array ends. The partial face [10] has different length than the
-        first face [0,1,2], so np.array() raises ValueError due to
-        inhomogeneous shape. This documents the actual behavior: the
-        adapter does not currently handle truncated data gracefully.
+        array ends. With bounds checking, the parser detects this and
+        breaks out of the loop, returning only the valid faces parsed
+        so far (in this case, just the first face [0, 1, 2]).
         """
         mesh = _FakePolyData([3, 0, 1, 2, 3, 10])  # second face truncated
-        with pytest.raises(ValueError):
-            self.adapter.get_faces(mesh)
+        faces = self.adapter.get_faces(mesh)
+        assert faces.shape == (1, 3)
+        np.testing.assert_array_equal(faces[0], [0, 1, 2])
 
     def test_result_faces_are_independent_of_source(self):
         """Modifying the returned array must not mutate the source mesh.faces.

@@ -39,7 +39,7 @@ def _discover_modules(base_dir):
                 dotted = dotted[:-9]
             if dotted == "__init__":
                 continue
-            modules.append(dotted)
+            modules.append(f"mesh_issue_examiner.{dotted}")
     return modules
 
 
@@ -62,29 +62,29 @@ class TestEveryModuleImportsCleanly:
                 pytest.fail(f"Failed to import {dotted}: {type(e).__name__}: {e}")
 
     def test_adapters_subpackage_imports(self):
-        import adapters.base_adapter
-        import adapters.pyvista_adapter
-        import adapters.trimesh_adapter
-        import adapters.pymeshlab_adapter
+        import mesh_issue_examiner.adapters.base_adapter
+        import mesh_issue_examiner.adapters.pyvista_adapter
+        import mesh_issue_examiner.adapters.trimesh_adapter
+        import mesh_issue_examiner.adapters.pymeshlab_adapter
 
     def test_operations_subpackage_imports(self):
-        import operations.base
-        import operations.operation_registry
-        import operations._registry
-        import operations.topological.nonmanifold_edges
+        import mesh_issue_examiner.operations.base
+        import mesh_issue_examiner.operations.operation_registry
+        import mesh_issue_examiner.operations._registry
+        import mesh_issue_examiner.operations.topological.nonmanifold_edges
 
     def test_core_subpackage_imports(self):
-        import core.models
-        import core.exceptions
+        import mesh_issue_examiner.core.models
+        import mesh_issue_examiner.core.exceptions
 
     def test_mcp_subpackage_imports(self):
-        import mcp.server
-        import mcp.handlers
-        import mcp.tools
+        import mesh_issue_examiner.mcp.server
+        import mesh_issue_examiner.mcp.handlers
+        import mesh_issue_examiner.mcp.tools
 
     def test_utils_subpackage_imports(self):
-        import utils.mesh_loader
-        import utils.metrics
+        import mesh_issue_examiner.utils.mesh_loader
+        import mesh_issue_examiner.utils.metrics
 
 
 class TestNoCircularImports:
@@ -92,30 +92,30 @@ class TestNoCircularImports:
 
     def test_operations_base_then_registry(self):
         """Importing base then registry must not raise ImportError."""
-        import operations.base
-        import operations.operation_registry
+        import mesh_issue_examiner.operations.base
+        import mesh_issue_examiner.operations.operation_registry
 
     def test_operations_registry_then_base(self):
         """Importing registry then base must not raise ImportError."""
-        import operations.operation_registry
-        import operations.base
+        import mesh_issue_examiner.operations.operation_registry
+        import mesh_issue_examiner.operations.base
 
     def test_get_registry_works_after_all_operations_imports(self):
         """get_registry() must return a valid OperationRegistry after
         importing the full operations subpackage."""
-        import operations.base
-        import operations.operation_registry
-        import operations._registry
-        import operations.topological.nonmanifold_edges
+        import mesh_issue_examiner.operations.base
+        import mesh_issue_examiner.operations.operation_registry
+        import mesh_issue_examiner.operations._registry
+        import mesh_issue_examiner.operations.topological.nonmanifold_edges
 
-        from operations.base import get_registry
-        from operations.operation_registry import OperationRegistry
+        from mesh_issue_examiner.operations.base import get_registry
+        from mesh_issue_examiner.operations.operation_registry import OperationRegistry
 
         reg = get_registry()
         assert isinstance(reg, OperationRegistry)
 
     def test_get_registry_is_singleton(self):
-        from operations.base import get_registry
+        from mesh_issue_examiner.operations.base import get_registry
         assert get_registry() is get_registry()
 
 
@@ -126,7 +126,7 @@ class TestModuleLevelSideEffects:
         """Operations that self-register at module level must appear in the
         global registry after import. If a future operation forgets its
         module-level register call, this test catches it."""
-        from operations.operation_registry import registry
+        from mesh_issue_examiner.operations.operation_registry import registry
 
         assert "topology.detect_nonmanifold_edges" in registry
 
@@ -136,5 +136,5 @@ class TestModuleLevelSideEffects:
         Guards against the class of bugs where module-level code in
         server.py triggers registration failures or import errors.
         """
-        from mcp.server import MeshIssueExaminerServer
+        from mesh_issue_examiner.mcp.server import MeshIssueExaminerServer
         assert callable(MeshIssueExaminerServer)

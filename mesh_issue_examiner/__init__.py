@@ -7,17 +7,18 @@ Designed for MCP (Model Context Protocol) server integration.
 
 __version__ = "0.1.0"
 
-from core.models import (
+from .core.models import (
     MeshInput,
     MeshIssue,
     QualityMetrics,
     InspectionResult,
     IssueCategory,
     IssueSeverity,
+    MeshDimensionality,
     OperationConfig,
 )
-from operations.operation_registry import registry
-from operations.base import register_operation
+from .operations.operation_registry import registry
+from .operations.base import register_operation
 
 __all__ = [
     "MeshInput",
@@ -26,6 +27,7 @@ __all__ = [
     "InspectionResult",
     "IssueCategory",
     "IssueSeverity",
+    "MeshDimensionality",
     "OperationConfig",
     "registry",
     "register_operation",

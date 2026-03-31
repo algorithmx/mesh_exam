@@ -11,7 +11,7 @@ Supports:
 
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -159,7 +159,7 @@ def _parse_grid(fields: List[str], nodes: Dict[int, Tuple[float, float, float]])
         pass
 
 
-def _parse_ctria3(fields: List[str]) -> Tuple[int, int, int] | None:
+def _parse_ctria3(fields: List[str]) -> Optional[Tuple[int, int, int]]:
     """Parse CTRIA3 card: CTRIA3,EID,PID,G1,G2,G3"""
     try:
         return (int(fields[3]), int(fields[4]), int(fields[5]))

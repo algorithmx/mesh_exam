@@ -2,13 +2,14 @@
 Core data models for mesh issue examination.
 """
 
-from core.models import (
+from .models import (
     MeshInput,
     MeshIssue,
     QualityMetrics,
     InspectionResult,
     IssueCategory,
     IssueSeverity,
+    MeshDimensionality,
     OperationConfig,
     Vertex,
     Face,
@@ -23,6 +24,7 @@ __all__ = [
     "InspectionResult",
     "IssueCategory",
     "IssueSeverity",
+    "MeshDimensionality",
     "OperationConfig",
     "Vertex",
     "Face",
