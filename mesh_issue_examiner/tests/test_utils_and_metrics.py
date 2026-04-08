@@ -34,15 +34,15 @@ class TestDefaultThresholds:
     """Tests for DEFAULT_THRESHOLDS constant."""
 
     EXPECTED_KEYS_AND_VALUES = {
-        'aspect_ratio': 0.3,
-        'skewness': 0.5,
-        'min_angle': 20.0,
-        'max_angle': 140.0,
-        'scaled_jacobian': 0.1,
-        'condition': 10.0,
-        'Jacobian': 0.0,
-        'volume': 1e-10,
+        'aspect_ratio': 10.0,
+        'min_angle': 15.0,
+        'max_angle': 120.0,
+        'scaled_jacobian': 0.5,
+        'condition': 100.0,
+        'shape': 0.25,
         'area': 1e-10,
+        'distortion': 0.5,
+        'radius_ratio': 2.0,
     }
 
     def test_all_expected_keys_exist(self):
@@ -84,9 +84,9 @@ class TestGetThreshold:
 
     def test_known_metric_returns_correct_value(self):
         """Known metric names should return their defined threshold."""
-        assert get_threshold('aspect_ratio') == 0.3
-        assert get_threshold('skewness') == 0.5
-        assert get_threshold('volume') == 1e-10
+        assert get_threshold('aspect_ratio') == 10.0
+        assert get_threshold('shape') == 0.25
+        assert get_threshold('area') == 1e-10
 
     def test_unknown_metric_returns_fallback(self):
         """Unknown metric names should return the fallback value 0.1."""
@@ -183,7 +183,7 @@ class TestComputeAllQualityMetrics:
         results = compute_all_quality_metrics(mesh, adapter)
 
         metric_names = [r.metric_name for r in results]
-        expected_defaults = ['aspect_ratio', 'skewness', 'min_angle', 'max_angle']
+        expected_defaults = ['aspect_ratio', 'min_angle', 'max_angle', 'scaled_jacobian']
         assert set(metric_names) == set(expected_defaults)
 
     def test_creates_quality_metrics_objects(self):
@@ -280,15 +280,12 @@ class TestComputeViolationStats:
 
     def test_nonempty_list_with_quality_metrics(self):
         """
-        NOTE: Line 99 of utils/metrics.py originally had a SyntaxError in the
-        generator expression.  The intended logic was a ternary selecting between
-        len(m.total_count) and len(m.values).  After the minimal syntax fix,
-        QualityMetrics has no `total_count` attribute, so hasattr returns False
-        and the function correctly falls back to len(m.values).
+        Test violation stats with a lower-is-worse metric.
+        scaled_jacobian < threshold is a violation.
         """
         qm = QualityMetrics(
-            operation_id='quality.aspect_ratio',
-            metric_name='aspect_ratio',
+            operation_id='quality.scaled_jacobian',
+            metric_name='scaled_jacobian',
             values=np.array([0.1, 0.2, 0.9]),
             threshold=0.3,
         )
@@ -296,8 +293,8 @@ class TestComputeViolationStats:
         # violation_count: values < 0.3 -> 0.1, 0.2  => 2 violations
         assert result['total_violations'] == 2
         assert result['total_elements'] == 3  # len(values)
-        assert result['by_metric']['aspect_ratio']['violation_count'] == 2
-        assert result['by_metric']['aspect_ratio']['total_count'] == 3
+        assert result['by_metric']['scaled_jacobian']['violation_count'] == 2
+        assert result['by_metric']['scaled_jacobian']['total_count'] == 3
 
 
 # ---------------------------------------------------------------------------

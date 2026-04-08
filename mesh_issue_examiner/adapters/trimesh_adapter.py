@@ -378,7 +378,7 @@ class TrimeshAdapter(MeshAdapter):
             grid = mesh_input.get_native('pyvista')
             
             # Extract surface
-            surface = grid.extract_surface()
+            surface = grid.extract_surface(algorithm='dataset_surface')
             
             # Convert to Trimesh format
             vertices = surface.points

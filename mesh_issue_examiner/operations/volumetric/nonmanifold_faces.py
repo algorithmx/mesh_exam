@@ -20,40 +20,7 @@ from ..base import BaseOperation, OperationMetadata
 from ...utils.metrics import determine_severity
 from ...utils.cell_types import ELEMENT_NODE_COUNT
 from ..operation_registry import registry
-
-
-# Face vertex indices for each element type
-# Each face is defined by the local vertex indices that form it
-ELEMENT_FACES: Dict[str, List[Tuple[int, ...]]] = {
-    'tet4': [
-        (0, 1, 2),  # Base triangle
-        (0, 2, 3),  # Side triangle
-        (0, 3, 1),  # Side triangle
-        (1, 3, 2),  # Side triangle
-    ],
-    'hex8': [
-        (0, 1, 2, 3),  # Bottom face
-        (4, 5, 6, 7),  # Top face
-        (0, 1, 5, 4),  # Front face
-        (1, 2, 6, 5),  # Right face
-        (2, 3, 7, 6),  # Back face
-        (3, 0, 4, 7),  # Left face
-    ],
-    'prism6': [
-        (0, 1, 2),     # Bottom triangle
-        (3, 4, 5),     # Top triangle
-        (0, 1, 4, 3),  # Side quad
-        (1, 2, 5, 4),  # Side quad
-        (2, 0, 3, 5),  # Side quad
-    ],
-    'pyramid5': [
-        (0, 1, 2, 3),  # Base quad
-        (0, 1, 4),     # Side triangle
-        (1, 2, 4),     # Side triangle
-        (2, 3, 4),     # Side triangle
-        (3, 0, 4),     # Side triangle
-    ],
-}
+from ._face_tables import ELEMENT_FACES
 
 
 class NonManifoldFaceDetection(BaseOperation):
@@ -248,7 +215,8 @@ class NonManifoldFaceDetection(BaseOperation):
         """Determine issue severity based on violation rate.
 
         Non-manifold faces are always serious topology errors, but the severity
-        scales with the extent of the problem.
+        scales with the extent of the problem. Uses centralized thresholds from
+        utils.metrics for consistency.
 
         Args:
             violation_rate: Fraction of unique faces that are non-manifold.
@@ -256,14 +224,8 @@ class NonManifoldFaceDetection(BaseOperation):
         Returns:
             Appropriate IssueSeverity level.
         """
-        if violation_rate > 0.1:  # More than 10% of faces
-            return IssueSeverity.CRITICAL
-        elif violation_rate > 0.05:  # More than 5% of faces
-            return IssueSeverity.ERROR
-        elif violation_rate > 0.01:  # More than 1% of faces
-            return IssueSeverity.WARNING
-        else:
-            return IssueSeverity.INFO
+        from ...utils.metrics import determine_severity
+        return determine_severity(violation_rate)
 
     # Maximum number of IssueLocation objects per issue (avoids huge reports)
     # This prevents memory issues when processing large meshes with many defects

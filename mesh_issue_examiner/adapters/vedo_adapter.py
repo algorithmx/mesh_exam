@@ -106,7 +106,7 @@ class VedoAdapter(MeshAdapter):
         # vedo.Mesh expects vertices and faces
         return vedo.Mesh([vertices, faces])
 
-    def from_canonical(self, mesh_input) -> Any:
+    def from_canonical(self, mesh_input: 'MeshInput') -> Any:
         """
         Create vedo mesh from canonical format.
 
@@ -130,14 +130,14 @@ class VedoAdapter(MeshAdapter):
         return vedo.Points(vertices)
 
     def _create_volumetric_mesh(self, mesh_input, vertices):
-        """Create vedo UGrid from volumetric cells.
+        """Create vedo UnstructuredGrid from volumetric cells.
         
         Args:
             mesh_input: MeshInput with volume_cells
             vertices: Vertex array
             
         Returns:
-            vedo.UGrid object
+            vedo.UnstructuredGrid object
             
         Raises:
             MeshConversionError: If conversion fails
@@ -156,25 +156,25 @@ class VedoAdapter(MeshAdapter):
                     logger.warning(f"Unknown element type '{etype}' skipped")
                     continue
 
-                n_nodes = connectivity.shape[1]
                 for row in connectivity:
-                    # Format: [n_nodes, idx0, idx1, ...]
-                    cell = [n_nodes] + row.tolist()
-                    cells.extend(cell)
+                    # Each cell is a list of node indices
+                    cells.append(row.tolist())
                     cell_types.append(vtk_type)
 
             if not cells:
                 raise ValueError("No valid volumetric cells found")
 
-            # Create vedo UGrid
-            return vedo.UGrid(
-                vertices=vertices,
-                cells=np.array(cells),
-                cell_types=np.array(cell_types)
-            )
+            # Create vedo UnstructuredGrid using the new API format:
+            # UnstructuredGrid([points, cells, celltypes])
+            # Note: cells must be a list of lists, not a flat array
+            return vedo.UnstructuredGrid([
+                vertices,
+                cells,
+                cell_types
+            ])
         except Exception as e:
             raise MeshConversionError(
-                f"Failed to create vedo UGrid from volumetric mesh: {e}"
+                f"Failed to create vedo UnstructuredGrid from volumetric mesh: {e}"
             ) from e
 
     def to_canonical(self, mesh: 'vedo.Mesh', mesh_id: str = "") -> 'MeshInput':
@@ -410,12 +410,15 @@ class VedoAdapter(MeshAdapter):
             # vedo has intersect_with method
             intersecting = mesh.intersect_with(mesh)
             if intersecting:
-                # Parse intersection results
-                return [(0, 0)]  # Placeholder - vedo returns mesh, not indices
+                # vedo returns mesh objects, not face-pair indices
+                logger.warning(
+                    "vedo self-intersection detected but face-pair indices "
+                    "are not available; falling back to trimesh"
+                )
         except Exception:
             pass
 
-        # Fallback to trimesh
+        # Fallback to trimesh for index-level results
         try:
             import trimesh
             faces = self.get_faces(mesh)

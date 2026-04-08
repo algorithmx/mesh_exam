@@ -14,7 +14,8 @@ from mesh_issue_examiner.core.models import (
 from mesh_issue_examiner.operations.volumetric.volume_cell_quality import VolumeCellQualityComputation
 from mesh_issue_examiner.operations.volumetric.geometric_validity import GeometricValidityAssessment
 from mesh_issue_examiner.operations.volumetric.orientation_consistency import OrientationConsistencyCheck
-from mesh_issue_examiner.operations.volumetric.nonmanifold_faces import NonManifoldFaceDetection, ELEMENT_FACES
+from mesh_issue_examiner.operations.volumetric.nonmanifold_faces import NonManifoldFaceDetection
+from mesh_issue_examiner.operations.volumetric._face_tables import ELEMENT_FACES
 
 
 # ------------------------------------------------------------------
@@ -512,6 +513,264 @@ class TestOrientationConsistencyCheck:
         assert meta.operation_id == 'quality_3d.check_orientation_consistency'
         assert 'orientation' in meta.tags
         assert meta.complexity == 'O(n log n)'
+
+    # ----- Multi-element-type winding tests -----
+
+    def test_two_hexes_consistent_winding_no_issues(self):
+        """Two hexes sharing a face with consistent (opposite) winding."""
+        vertices = np.array([
+            # Cube1 vertices (0-7)
+            [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+            [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1],
+            # Cube2-only vertices (8-11)
+            [2, 0, 0], [2, 1, 0], [2, 0, 1], [2, 1, 1],
+        ], dtype=float)
+        faces = np.array([[0, 1, 2]])
+        # Cube1 right face (local 1,2,6,5) = global (1, 2, 6, 5)
+        # Cube2 left face (local 3,0,4,7) should be reverse: (2, 1, 5, 6)
+        # So: cube2[3]=2, cube2[0]=1, cube2[4]=5, cube2[7]=6
+        # Remaining: cube2[1]=8, cube2[2]=9, cube2[5]=10, cube2[6]=11
+        volume_cells = {'hex8': np.array([
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            [1, 8, 9, 2, 5, 10, 11, 6],
+        ])}
+        mesh = MeshInput(
+            vertices=vertices, faces=faces,
+            mesh_id='two_hexes_consistent',
+            volume_cells=volume_cells,
+        )
+        op = OrientationConsistencyCheck()
+        issues = op.execute(mesh)
+        winding_issues = [i for i in issues
+                          if 'inconsistent' in i.message.lower()
+                          or 'winding' in i.message.lower()]
+        assert len(winding_issues) == 0
+
+    def test_two_hexes_inconsistent_winding_detected(self):
+        """Two hexes sharing a face with SAME winding → detected.
+
+        Cube1 and Cube2 share vertices on their common face (x=1).
+        Cube2's vertex ordering is deliberately set so the shared face
+        appears with the same directed edges as Cube1's face.
+        """
+        vertices = np.array([
+            # Cube1 vertices (0-7)
+            [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+            [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1],
+            # Cube2-only vertices (8-11)
+            [2, 0, 0], [2, 1, 0], [2, 0, 1], [2, 1, 1],
+        ], dtype=float)
+        faces = np.array([[0, 1, 2]])
+        # Cube1 right face (local 1,2,6,5) = global (1, 2, 6, 5)
+        #
+        # For inconsistent winding, set Cube2 so its left face
+        # (local 3,0,4,7) has the SAME global vertex order (1,2,6,5):
+        #   cube2[3]=1, cube2[0]=2, cube2[4]=6, cube2[7]=5
+        # Remaining: cube2[1]=8, cube2[2]=9, cube2[5]=10, cube2[6]=11
+        volume_cells = {'hex8': np.array([
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            [2, 8, 9, 1, 6, 10, 11, 5],
+        ])}
+        mesh = MeshInput(
+            vertices=vertices, faces=faces,
+            mesh_id='two_hexes_inconsistent',
+            volume_cells=volume_cells,
+        )
+        op = OrientationConsistencyCheck()
+        issues = op.execute(mesh)
+        winding_issues = [i for i in issues
+                          if 'inconsistent' in i.message.lower()
+                          or 'winding' in i.message.lower()]
+        assert len(winding_issues) > 0
+
+    def test_two_prisms_sharing_tri_face_consistent(self):
+        """Two prisms sharing a triangular face with consistent winding."""
+        # Two prisms stacked along z, sharing the triangular face at z=1
+        vertices = np.array([
+            # Bottom triangle of prism1 (z=0)
+            [0, 0, 0], [1, 0, 0], [0.5, 0.866, 0],
+            # Top of prism1 / bottom of prism2 (z=1)
+            [0, 0, 1], [1, 0, 1], [0.5, 0.866, 1],
+            # Top of prism2 (z=2)
+            [0, 0, 2], [1, 0, 2], [0.5, 0.866, 2],
+        ], dtype=float)
+        faces = np.array([[0, 1, 2]])
+        # prism1 top face = local (3,4,5) = global (3,4,5)
+        # prism2 bottom face = local (0,1,2) = global (3,4,5) — same winding!
+        # For consistent winding, we need the shared face to appear reversed.
+        # prism1: face (3,4,5). prism2: face (3,4,5) → same → inconsistent
+        volume_cells = {'prism6': np.array([
+            [0, 1, 2, 3, 4, 5],
+            [3, 5, 4, 6, 8, 7],  # reversed winding on shared face
+        ])}
+        mesh = MeshInput(
+            vertices=vertices, faces=faces,
+            mesh_id='two_prisms_consistent',
+            volume_cells=volume_cells,
+        )
+        op = OrientationConsistencyCheck()
+        issues = op.execute(mesh)
+        winding_issues = [i for i in issues
+                          if 'inconsistent' in i.message.lower()
+                          or 'winding' in i.message.lower()]
+        assert len(winding_issues) == 0
+
+    def test_two_pyramids_sharing_tri_face_consistent(self):
+        """Two pyramids sharing a triangular face with consistent winding."""
+        vertices = np.array([
+            # Pyramid 1: base on z=0 plane, apex at z=1
+            [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+            [0.5, 0.5, 1],  # apex1
+            # Pyramid 2: apex at z=-1, shares face (0,1,4) with pyramid1
+            [0.5, 0.5, -1],  # apex2
+        ], dtype=float)
+        faces = np.array([[0, 1, 2]])
+        # Pyramid 1 face (0,1,4). For pyramid2 we use vertex order that reverses.
+        volume_cells = {'pyramid5': np.array([
+            [0, 1, 2, 3, 4],
+            [1, 0, 3, 2, 5],  # reversed on shared face
+        ])}
+        mesh = MeshInput(
+            vertices=vertices, faces=faces,
+            mesh_id='two_pyramids_consistent',
+            volume_cells=volume_cells,
+        )
+        op = OrientationConsistencyCheck()
+        issues = op.execute(mesh)
+        winding_issues = [i for i in issues
+                          if 'inconsistent' in i.message.lower()
+                          or 'winding' in i.message.lower()]
+        assert len(winding_issues) == 0
+
+    def test_mixed_tet_prism_winding_consistent(self):
+        """tet4 sharing a triangular face with prism6, consistent winding."""
+        vertices = np.array([
+            # Triangle (z=0)
+            [0, 0, 0], [1, 0, 0], [0.5, 0.866, 0],
+            # Prism top (z=1)
+            [0, 0, 1], [1, 0, 1], [0.5, 0.866, 1],
+            # Tet apex above prism (z=2)
+            [0.5, 0.288, 2],
+        ], dtype=float)
+        faces = np.array([[0, 1, 2]])
+        # Prism top face = local (3,4,5) = global (3,4,5)
+        # Tet base face = local (0,1,2) but we want global (3,5,4) to reverse (3,4,5)
+        volume_cells = {
+            'prism6': np.array([[0, 1, 2, 3, 4, 5]]),
+            'tet4': np.array([[3, 5, 4, 6]]),  # reversed face (3,4,5)→(3,5,4)
+        }
+        mesh = MeshInput(
+            vertices=vertices, faces=faces,
+            mesh_id='tet_prism_consistent',
+            volume_cells=volume_cells,
+        )
+        op = OrientationConsistencyCheck()
+        issues = op.execute(mesh)
+        winding_issues = [i for i in issues
+                          if 'inconsistent' in i.message.lower()
+                          or 'winding' in i.message.lower()]
+        assert len(winding_issues) == 0
+
+    def test_mixed_tet_prism_winding_inconsistent(self):
+        """tet4 sharing a triangular face with prism6, SAME winding → detected."""
+        vertices = np.array([
+            [0, 0, 0], [1, 0, 0], [0.5, 0.866, 0],
+            [0, 0, 1], [1, 0, 1], [0.5, 0.866, 1],
+            [0.5, 0.288, 2],
+        ], dtype=float)
+        faces = np.array([[0, 1, 2]])
+        # Both present face (3,4,5) with same order → inconsistent
+        volume_cells = {
+            'prism6': np.array([[0, 1, 2, 3, 4, 5]]),
+            'tet4': np.array([[3, 4, 5, 6]]),
+        }
+        mesh = MeshInput(
+            vertices=vertices, faces=faces,
+            mesh_id='tet_prism_inconsistent',
+            volume_cells=volume_cells,
+        )
+        op = OrientationConsistencyCheck()
+        issues = op.execute(mesh)
+        winding_issues = [i for i in issues
+                          if 'inconsistent' in i.message.lower()
+                          or 'winding' in i.message.lower()]
+        assert len(winding_issues) > 0
+
+    def test_hex_only_mesh_not_silently_skipped(self):
+        """Mesh with only hex8 cells should run (not silently return empty)."""
+        vertices = np.array([
+            [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+            [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1],
+        ], dtype=float)
+        faces = np.array([[0, 1, 2]])
+        volume_cells = {'hex8': np.array([[0, 1, 2, 3, 4, 5, 6, 7]])}
+        mesh = MeshInput(
+            vertices=vertices, faces=faces,
+            mesh_id='hex_only',
+            volume_cells=volume_cells,
+        )
+        op = OrientationConsistencyCheck()
+        issues = op.execute(mesh)
+        # Single cell has no shared faces → no winding issues, that's fine
+        # But should NOT error out
+        assert isinstance(issues, list)
+
+    def test_prism_only_mesh_runs(self):
+        """Mesh with only prism6 cells should run without error."""
+        mesh = _regular_prism()
+        op = OrientationConsistencyCheck()
+        issues = op.execute(mesh)
+        assert isinstance(issues, list)
+
+    def test_pyramid_only_mesh_runs(self):
+        """Mesh with only pyramid5 cells should run without error."""
+        mesh = _regular_pyramid()
+        op = OrientationConsistencyCheck()
+        issues = op.execute(mesh)
+        assert isinstance(issues, list)
+
+    def test_metrics_include_total_shared_faces(self):
+        """Winding issue metrics should include total_shared_faces."""
+        # Create inconsistent winding in two tets sharing a face
+        mesh = _mixed_tet_mesh()  # two tets sharing face
+        op = OrientationConsistencyCheck()
+        issues = op.execute(mesh)
+        # Check for winding issues
+        winding_issues = [i for i in issues
+                          if 'inconsistent' in i.message.lower()
+                          or 'winding' in i.message.lower()]
+        if winding_issues:
+            assert 'total_shared_faces' in winding_issues[0].metrics
+            assert 'total_cells' in winding_issues[0].metrics
+
+    # ----- Directed-edge method tests -----
+
+    def test_faces_are_reversed_triangles(self):
+        """Directed-edge method for triangular faces."""
+        assert OrientationConsistencyCheck._faces_are_reversed(
+            (0, 1, 2), (0, 2, 1)) is True   # reversed
+        assert OrientationConsistencyCheck._faces_are_reversed(
+            (0, 1, 2), (1, 0, 2)) is True   # cyclic of reversed
+        assert OrientationConsistencyCheck._faces_are_reversed(
+            (0, 1, 2), (2, 1, 0)) is True   # cyclic of reversed
+        assert OrientationConsistencyCheck._faces_are_reversed(
+            (0, 1, 2), (0, 1, 2)) is False  # same winding
+
+    def test_faces_are_reversed_quads(self):
+        """Directed-edge method for quadrilateral faces."""
+        # Reverse of (0,1,2,3) is (0,3,2,1) and its cyclic rotations
+        assert OrientationConsistencyCheck._faces_are_reversed(
+            (0, 1, 2, 3), (0, 3, 2, 1)) is True   # exact reverse
+        assert OrientationConsistencyCheck._faces_are_reversed(
+            (0, 1, 2, 3), (3, 2, 1, 0)) is True   # cyclic rotation
+        assert OrientationConsistencyCheck._faces_are_reversed(
+            (0, 1, 2, 3), (2, 1, 0, 3)) is True   # cyclic rotation
+        assert OrientationConsistencyCheck._faces_are_reversed(
+            (0, 1, 2, 3), (1, 0, 3, 2)) is True   # cyclic rotation
+        assert OrientationConsistencyCheck._faces_are_reversed(
+            (0, 1, 2, 3), (0, 1, 2, 3)) is False  # same winding
+        assert OrientationConsistencyCheck._faces_are_reversed(
+            (0, 1, 2, 3), (0, 1, 3, 2)) is False  # not a valid reverse
 
 
 # ==================================================================

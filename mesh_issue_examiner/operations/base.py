@@ -18,6 +18,7 @@ from ..core.models import (
     IssueSeverity,
     OperationConfig,
 )
+from ..core.exceptions import MeshExaminerError
 
 
 @dataclass
@@ -104,11 +105,9 @@ class BaseOperation(ABC):
         This method wraps execute() with timing and error handling,
         providing consistent behavior across all operations.
         """
-        original_config = self.config
+        active_config = config if config is not None else self.config
         original_caching = getattr(mesh, '_caching_enabled', True)
-        if config is not None:
-            self.config = config
-        mesh._caching_enabled = self.config.enable_caching
+        mesh._caching_enabled = active_config.enable_caching
         start_time = time.perf_counter()
         self._execution_count += 1
 
@@ -124,7 +123,6 @@ class BaseOperation(ABC):
             ) from e
         finally:
             mesh._caching_enabled = original_caching
-            self.config = original_config
 
     @property
     def statistics(self) -> Dict[str, Any]:
@@ -207,7 +205,7 @@ class QualityOperation(ABC):
             return IssueSeverity.INFO
 
 
-class OperationError(Exception):
+class OperationError(MeshExaminerError):
     """Exception raised when an operation fails."""
     pass
 

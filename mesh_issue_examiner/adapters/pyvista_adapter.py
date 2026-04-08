@@ -159,7 +159,7 @@ class PyVistaAdapter(MeshAdapter):
 
         return pv.PolyData(vertices, face_arr)
 
-    def from_canonical(self, mesh_input: 'MeshInput') -> Any:
+    def from_canonical(self, mesh_input: 'MeshInput') -> 'Union[pyvista.PolyData, pyvista.UnstructuredGrid]':
         """Create PyVista mesh from canonical format.
 
         Supports both surface (PolyData) and volumetric (UnstructuredGrid) meshes.
@@ -234,14 +234,74 @@ class PyVistaAdapter(MeshAdapter):
         """
         return np.array(mesh.points)
 
+    def get_volume_cells(self, mesh: Any) -> Dict[str, np.ndarray]:
+        """Extract volumetric cells from a PyVista UnstructuredGrid."""
+        import pyvista as pv
+        from ..utils.cell_types import get_vtk_type_to_name
+
+        if not isinstance(mesh, pv.UnstructuredGrid) or mesh.n_cells == 0:
+            return {}
+
+        vtk_to_name = get_vtk_type_to_name()
+        cells_by_type = {}
+        celltypes = mesh.celltypes
+        for i in range(mesh.n_cells):
+            vtk_type = int(celltypes[i])
+            name = vtk_to_name.get(vtk_type)
+            if name is not None:
+                cell = mesh.get_cell(i)
+                if name not in cells_by_type:
+                    cells_by_type[name] = []
+                cells_by_type[name].append(cell.point_ids)
+
+        return {k: np.array(v) for k, v in cells_by_type.items()} if cells_by_type else {}
+
+    def to_canonical(self, mesh: Any, mesh_id: str = "") -> 'MeshInput':
+        """Convert PyVista mesh to canonical MeshInput format.
+
+        Handles both PolyData (surface) and UnstructuredGrid (volumetric).
+
+        Args:
+            mesh: PyVista PolyData or UnstructuredGrid
+            mesh_id: Optional mesh identifier
+
+        Returns:
+            MeshInput in canonical format
+        """
+        import pyvista as pv
+        from ..core.models import MeshInput
+
+        vertices = np.array(mesh.points)
+
+        # Extract surface faces
+        faces = np.array([])
+        if isinstance(mesh, pv.PolyData):
+            faces = self.get_faces(mesh)
+        elif isinstance(mesh, pv.UnstructuredGrid):
+            surf = mesh.extract_surface(algorithm='dataset_surface')
+            if surf.n_cells > 0:
+                faces = self.get_faces(surf)
+
+        # Extract volume cells
+        volume_cells = self.get_volume_cells(mesh)
+        volume_cells = volume_cells if volume_cells else None
+
+        return MeshInput(
+            vertices=vertices,
+            faces=faces,
+            mesh_id=mesh_id,
+            source_format='vtk',
+            volume_cells=volume_cells,
+        )
+
     # Maximum reasonable vertices per face to prevent issues with malformed data
     _MAX_VERTS_PER_FACE = 1000
 
-    def get_faces(self, mesh: 'pyvista.PolyData') -> Union[np.ndarray, List[List[int]]]:
+    def get_faces(self, mesh: 'pyvista.PolyData') -> np.ndarray:
         """Extract face array (removing vertex count prefix).
         
         Handles mixed face types (triangles, quads, polygons) by returning
-        a list of lists when face sizes are inconsistent.
+        a ragged/jagged numpy array (dtype=object) when face sizes are inconsistent.
         
         Args:
             mesh: PyVista mesh object
@@ -249,13 +309,13 @@ class PyVistaAdapter(MeshAdapter):
         Returns:
             - Mx3 array for triangular meshes
             - Mx4 array for quad meshes  
-            - List of lists for mixed face types
+            - 1D numpy array with dtype=object containing face index lists for mixed types
             - Empty array if mesh has no faces
             
         Note:
-            Returns inconsistent types based on face uniformity. Callers should
-            check return type with ``isinstance(result, list)`` to handle both cases.
-            For consistent array output, use ``get_faces_as_array()`` instead.
+            For mixed face types, returns a 1D object array where each element is a 
+            numpy array of vertex indices. Use ``isinstance(result[0], np.ndarray)`` 
+            or check ``result.dtype == object`` to detect this case.
         """
         faces = mesh.faces
         if faces is None or len(faces) == 0:
@@ -299,15 +359,12 @@ class PyVistaAdapter(MeshAdapter):
         
         if len(face_sizes) == 1:
             # Uniform face size - return as 2D array
-            try:
-                return np.array(face_list)
-            except ValueError:
-                # Fallback to list if numpy conversion fails
-                return face_list
+            return np.array(face_list)
         else:
-            # Mixed face sizes - return as list of lists
+            # Mixed face sizes - return as 1D object array for type consistency
+            # Each element is a numpy array of vertex indices
             logger.debug(f"Mixed face sizes detected: {face_sizes}")
-            return face_list
+            return np.array([np.array(face, dtype=np.int64) for face in face_list], dtype=object)
 
     def is_watertight(self, mesh: 'pyvista.PolyData') -> bool:
         """Check if mesh is watertight.
@@ -394,21 +451,15 @@ class PyVistaAdapter(MeshAdapter):
         """
         faces = self.get_faces(mesh)
         
-        # Handle list return type for mixed faces
-        if isinstance(faces, list):
-            n_faces = len(faces)
-        else:
-            n_faces = len(faces)
-            if n_faces == 0:
-                return []
+        # Handle object dtype array for mixed face sizes
+        n_faces = len(faces)
+        if n_faces == 0:
+            return []
 
         # Build edge-to-face adjacency
         edges = {}
         for face_idx in range(n_faces):
-            if isinstance(faces, list):
-                face = faces[face_idx]
-            else:
-                face = faces[face_idx]
+            face = faces[face_idx]
             
             n_verts = len(face)
             for i in range(n_verts):
@@ -445,7 +496,7 @@ class PyVistaAdapter(MeshAdapter):
         """
         try:
             # Use VTK's duplicate point removal
-            cleaned = mesh.clean(tolerance=tolerance, merge_tol=tolerance)
+            cleaned = mesh.clean(tolerance=tolerance)
             original_count = mesh.n_points
             cleaned_count = cleaned.n_points
 
@@ -487,21 +538,15 @@ class PyVistaAdapter(MeshAdapter):
         faces = self.get_faces(mesh)
         vertices = self.get_vertices(mesh)
         
-        # Handle list return type
-        if isinstance(faces, list):
-            n_faces = len(faces)
-        else:
-            n_faces = len(faces)
+        # Handle both uniform and mixed face types
+        n_faces = len(faces)
         
         if n_faces == 0:
             return np.array([])
 
         areas = np.zeros(n_faces)
         for i in range(n_faces):
-            if isinstance(faces, list):
-                face = faces[i]
-            else:
-                face = faces[i]
+            face = faces[i]
             
             v = vertices[face]
             if len(v) >= 3:
@@ -540,20 +585,14 @@ class PyVistaAdapter(MeshAdapter):
         faces = self.get_faces(mesh)
         vertices = self.get_vertices(mesh)
         
-        if isinstance(faces, list):
-            n_faces = len(faces)
-        else:
-            n_faces = len(faces)
+        n_faces = len(faces)
         
         if n_faces == 0:
             return np.array([])
 
         normals = np.zeros((n_faces, 3))
         for i in range(n_faces):
-            if isinstance(faces, list):
-                face = faces[i]
-            else:
-                face = faces[i]
+            face = faces[i]
             
             v = vertices[face]
             if len(v) >= 3:
@@ -566,23 +605,146 @@ class PyVistaAdapter(MeshAdapter):
 
         return normals
 
-    def detect_self_intersections(self, mesh: 'pyvista.PolyData') -> List[Tuple[int, int]]:
-        """Detect self-intersections using VTK.
+    def detect_self_intersections(
+        self,
+        mesh: 'pyvista.PolyData',
+        method: str = 'manual',
+        tolerance: float = 1e-10
+    ) -> List[Tuple[int, int]]:
+        """Detect self-intersections in mesh triangles.
+        
+        Uses manual Möller-Trumbore triangle-triangle intersection detection
+        with KD-tree spatial acceleration to avoid false positives from
+        pymeshfix.
+        
+        Two methods available:
+        - 'manual' (default): Uses our manual implementation with Möller-Trumbore
+          algorithm and KD-tree spatial indexing. More accurate, fewer false positives.
+        - 'pymeshfix': Uses Marco Attene's MeshFix algorithm via pymeshfix.
+          May produce false positives on valid meshes.
+        
+        Args:
+            mesh: PyVista mesh object
+            method: Detection method ('manual' or 'pymeshfix')
+            tolerance: Numerical tolerance for intersection tests (manual method only)
+            
+        Returns:
+            List of (face_index1, face_index2) tuples for each intersecting pair.
+            Returns empty list if no intersections found.
+        """
+        if method == 'manual':
+            return self._detect_self_intersections_manual(mesh, tolerance)
+        elif method == 'pymeshfix':
+            return self._detect_self_intersections_pymeshfix(mesh)
+        else:
+            logger.warning(f"Unknown self-intersection method '{method}', using manual")
+            return self._detect_self_intersections_manual(mesh, tolerance)
+
+    def _detect_self_intersections_manual(
+        self,
+        mesh: 'pyvista.PolyData',
+        tolerance: float = 1e-10
+    ) -> List[Tuple[int, int]]:
+        """Manual self-intersection detection using Möller-Trumbore algorithm.
+        
+        Uses KD-tree spatial indexing to efficiently find candidate triangle pairs,
+        then tests each pair using the Möller-Trumbore triangle-triangle
+        intersection test.
+        
+        Args:
+            mesh: PyVista mesh object
+            tolerance: Numerical tolerance for intersection tests
+            
+        Returns:
+            List of (face_index1, face_index2) tuples for intersecting pairs
+        """
+        try:
+            from ..utils.triangle_intersection import detect_self_intersections_manual
+            
+            # Extract vertices
+            vertices = np.array(mesh.points, dtype=np.float64)
+            
+            # Get faces and convert from VTK format [n_verts, v0, v1, v2, ...]
+            faces_vtk = mesh.faces
+            if faces_vtk is None or len(faces_vtk) == 0:
+                return []
+            
+            # Reshape to Nx4 array (first column is vertex count)
+            faces_reshaped = faces_vtk.reshape(-1, 4)
+            # Extract just the vertex indices (skip first column which is count)
+            faces = faces_reshaped[:, 1:4].astype(np.int32)
+            
+            # Use manual detection
+            return detect_self_intersections_manual(vertices, faces, tolerance)
+            
+        except ImportError as e:
+            logger.debug(f"Manual self-intersection detection not available: {e}")
+            return []
+        except Exception as e:
+            logger.debug(f"Manual self-intersection detection failed: {e}")
+            return []
+
+    def _detect_self_intersections_pymeshfix(
+        self,
+        mesh: 'pyvista.PolyData'
+    ) -> List[Tuple[int, int]]:
+        """Self-intersection detection using pymeshfix (legacy method).
+        
+        NOTE: This method is kept for backwards compatibility but may produce
+        false positives on valid meshes. Use 'manual' method for better accuracy.
         
         Args:
             mesh: PyVista mesh object
             
         Returns:
-            List of (face1_index, face2_index) tuples
+            List of (face_index, -1) tuples for each intersecting triangle
         """
         try:
-            # Try to use mesh intersection check
-            if hasattr(mesh, 'check_intersection'):
-                intersections = mesh.check_intersection()
-                return intersections
+            from pymeshfix import PyTMesh
+            
+            # Extract vertices and faces
+            vertices = np.array(mesh.points)
+            
+            # Get faces and convert from VTK format [n_verts, v0, v1, v2, ...]
+            faces_vtk = mesh.faces
+            if faces_vtk is None or len(faces_vtk) == 0:
+                return []
+            
+            # Reshape to Nx4 array (first column is vertex count)
+            faces_reshaped = faces_vtk.reshape(-1, 4)
+            # Extract just the vertex indices (skip first column which is count)
+            faces = faces_reshaped[:, 1:4].astype(np.int32)
+            
+            # Create meshfix object
+            tin = PyTMesh()
+            tin.load_array(vertices, faces)
+            
+            # Get intersecting triangles
+            intersecting = tin.select_intersecting_triangles()
+            
+            intersections = []
+            if len(intersecting) > 0:
+                # Extract unique face indices from first column
+                # Filter to valid range [0, n_faces)
+                n_faces = len(faces)
+                face_indices = set()
+                for row in intersecting:
+                    idx = int(row[0])
+                    if 0 <= idx < n_faces:
+                        face_indices.add(idx)
+                
+                # Return as list of (face_idx, -1) tuples
+                # -1 indicates we don't have specific paired face info
+                intersections = [(idx, -1) for idx in sorted(face_indices)]
+            
+            return intersections
+            
+        except ImportError:
+            logger.debug("pymeshfix not available for self-intersection detection")
+            return []
         except Exception as e:
-            logger.debug(f"Could not detect self-intersections: {e}")
-        return []
+            logger.debug(f"Self-intersection detection failed: {e}")
+            return []
 
     def compute_cell_quality(
         self,

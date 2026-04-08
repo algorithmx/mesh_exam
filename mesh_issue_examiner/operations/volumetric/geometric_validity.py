@@ -6,9 +6,12 @@ Detects degenerate cells (near-zero volume) and sliver elements
 in volumetric meshes.
 """
 
+import logging
 from typing import List, Optional, Dict
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from ...core.models import (
     MeshInput,
@@ -251,11 +254,11 @@ class GeometricValidityAssessment(BaseOperation):
             )
         safe_max_edge = np.where(max_edge > 0, max_edge, 1.0)
 
-        sliver_ratio = tet_volumes / (safe_max_edge ** 3)
+        sliver_ratio = np.abs(tet_volumes) / (safe_max_edge ** 3)
 
         sliver_mask = (
             (~tet_degenerate) &
-            (tet_volumes > self.degenerate_tolerance) &
+            (np.abs(tet_volumes) > self.degenerate_tolerance) &
             (sliver_ratio < self.sliver_threshold)
         )
 
@@ -310,11 +313,11 @@ class GeometricValidityAssessment(BaseOperation):
         max_edge = np.max(edge_lengths, axis=1)
         safe_max_edge = np.where(max_edge > 0, max_edge, 1.0)
 
-        sliver_ratio = hex_volumes / (safe_max_edge ** 3)
+        sliver_ratio = np.abs(hex_volumes) / (safe_max_edge ** 3)
 
         sliver_mask = (
             (~hex_degenerate) &
-            (hex_volumes > self.degenerate_tolerance) &
+            (np.abs(hex_volumes) > self.degenerate_tolerance) &
             (sliver_ratio < self.sliver_threshold)
         )
 
@@ -362,11 +365,11 @@ class GeometricValidityAssessment(BaseOperation):
         max_edge = np.max(edge_lengths, axis=1)
         safe_max_edge = np.where(max_edge > 0, max_edge, 1.0)
 
-        sliver_ratio = prism_volumes / (safe_max_edge ** 3)
+        sliver_ratio = np.abs(prism_volumes) / (safe_max_edge ** 3)
 
         sliver_mask = (
             (~prism_degenerate) &
-            (prism_volumes > self.degenerate_tolerance) &
+            (np.abs(prism_volumes) > self.degenerate_tolerance) &
             (sliver_ratio < self.sliver_threshold)
         )
 
@@ -413,11 +416,11 @@ class GeometricValidityAssessment(BaseOperation):
         max_edge = np.max(edge_lengths, axis=1)
         safe_max_edge = np.where(max_edge > 0, max_edge, 1.0)
 
-        sliver_ratio = pyramid_volumes / (safe_max_edge ** 3)
+        sliver_ratio = np.abs(pyramid_volumes) / (safe_max_edge ** 3)
 
         sliver_mask = (
             (~pyramid_degenerate) &
-            (pyramid_volumes > self.degenerate_tolerance) &
+            (np.abs(pyramid_volumes) > self.degenerate_tolerance) &
             (sliver_ratio < self.sliver_threshold)
         )
 

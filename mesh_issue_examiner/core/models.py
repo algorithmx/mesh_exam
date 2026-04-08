@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Dict, Optional, Any, Tuple, Union
 from pathlib import Path
+import threading
 import numpy as np
 
 
@@ -141,7 +142,17 @@ class QualityMetrics:
                 'p95': float(np.percentile(self.values, 95))
             }
             if self.threshold is not None:
-                self.violation_count = int(np.sum(self.values < self.threshold))
+                # Filter out undefined values (-1 is VTK's default for undefined quality)
+                valid_values = self.values[self.values != -1.0]
+                if len(valid_values) > 0:
+                    # Metrics where higher values are worse (violation if value > threshold)
+                    HIGHER_IS_WORSE = {'max_angle', 'condition', 'aspect_ratio'}
+                    if self.metric_name in HIGHER_IS_WORSE:
+                        self.violation_count = int(np.sum(valid_values > self.threshold))
+                    else:
+                        self.violation_count = int(np.sum(valid_values < self.threshold))
+                else:
+                    self.violation_count = 0
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary representation."""
@@ -215,7 +226,7 @@ class InspectionResult:
                not self.summary.get('has_errors', False)
 
 
-@dataclass
+@dataclass(frozen=True)
 class OperationConfig:
     """Configuration for mesh operations."""
     tolerance: float = 1e-6
@@ -244,7 +255,30 @@ class MeshInput:
     Wraps library-specific mesh objects for transparent interchange
     between different mesh processing libraries. Supports both surface
     meshes (faces) and volumetric meshes (volume_cells).
+
+    Example -- surface mesh::
+
+        mesh = MeshInput(
+            vertices=np.array([[0,0,0],[1,0,0],[0,1,0],[0,0,1]]),
+            faces=np.array([[0,1,2],[0,1,3],[1,2,3],[0,2,3]]),
+            mesh_id="tet_surface"
+        )
+
+    Example -- volumetric mesh with tetrahedral cells::
+
+        mesh = MeshInput(
+            vertices=np.array([[0,0,0],[1,0,0],[0,1,0],[0,0,1]]),
+            faces=np.array([[0,1,2],[0,1,3],[1,2,3],[0,2,3]]),
+            mesh_id="one_tet",
+            volume_cells={"tet4": np.array([[0,1,2,3]])}
+        )
+
+    The ``volume_cells`` dict maps element type names (e.g. ``"tet4"``,
+    ``"hex8"``, ``"prism6"``, ``"pyramid5"``) to NxK connectivity arrays
+    where N is the number of cells and K is the number of nodes per cell.
     """
+
+    _MAX_CACHE_SIZE = 8
 
     def __init__(
         self,
@@ -265,6 +299,7 @@ class MeshInput:
         self.source_format = source_format
         self._native_objects: Dict[str, Any] = {}
         self._adjacency_cache: Dict[str, Any] = {}
+        self._lock = threading.Lock()
 
         # Volume cells: dict mapping element type name -> NxK connectivity array
         self._volume_cells: Dict[str, np.ndarray] = {}
@@ -361,17 +396,18 @@ class MeshInput:
 
     def get_native(self, library: str) -> Any:
         """Get library-specific mesh object, constructing if needed.
-        
-        .. note::
-            This method is not thread-safe. If multiple threads call
-            ``get_native()`` simultaneously for the same library,
-            ``_construct_native()`` may be called multiple times.
-            For thread-safe usage, external synchronization is required.
+
+        Uses double-checked locking for thread safety: the outer check
+        avoids acquiring the lock on the hot path (already-cached), while
+        the inner check prevents redundant construction when multiple
+        threads pass the outer check simultaneously.
         """
         caching = getattr(self, '_caching_enabled', True)
         if caching:
             if library not in self._native_objects:
-                self._construct_native(library)
+                with self._lock:
+                    if library not in self._native_objects:
+                        self._construct_native(library)
             return self._native_objects[library]
         # Bypass cache: construct fresh object without storing it
         from ..adapters.factory import get_adapter
@@ -383,11 +419,16 @@ class MeshInput:
         from ..adapters.factory import get_adapter
         adapter = get_adapter(library)
         self._native_objects[library] = adapter.from_canonical(self)
+        # Evict oldest entries if cache exceeds limit
+        while len(self._native_objects) > self._MAX_CACHE_SIZE:
+            oldest_key = next(iter(self._native_objects))
+            del self._native_objects[oldest_key]
 
     def invalidate_cache(self):
         """Clear cached data when mesh is modified."""
-        self._native_objects.clear()
-        self._adjacency_cache.clear()
+        with self._lock:
+            self._native_objects.clear()
+            self._adjacency_cache.clear()
 
     def copy(self) -> 'MeshInput':
         """Create a deep copy of this mesh."""

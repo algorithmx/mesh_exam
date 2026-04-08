@@ -47,7 +47,7 @@ class VolumeCellQualityComputation(BaseOperation):
         super().__init__(config)
         self.quality_types = quality_types or [
             'scaled_jacobian', 'volume', 'aspect_ratio',
-            'condition', 'skew',
+            'condition', 'shape',
         ]
 
         # Default thresholds for 3D elements
@@ -56,10 +56,14 @@ class VolumeCellQualityComputation(BaseOperation):
             'volume': 1e-12,
             'aspect_ratio': 0.1,
             'condition': 100.0,
+            'shape': 0.3,
             'skewness': 0.8,
             'skew': 0.8,
             'orthogonality': 0.15,
         }
+
+        # Metrics where higher values are worse (violation if value > threshold)
+        self._higher_is_worse = {'condition'}
 
     @property
     def metadata(self) -> OperationMetadata:
@@ -108,9 +112,19 @@ class VolumeCellQualityComputation(BaseOperation):
             if threshold is None:
                 continue
 
-            violation_mask = values < threshold
+            # Filter out VTK sentinel value -1 (undefined metric)
+            valid_mask = values != -1.0
+            valid_values = values[valid_mask]
+            if len(valid_values) == 0:
+                continue
+
+            # Determine violations based on metric direction
+            if quality_type in self._higher_is_worse:
+                violation_mask = valid_values > threshold
+            else:
+                violation_mask = valid_values < threshold
             violations = int(np.sum(violation_mask))
-            total = len(values)
+            total = len(valid_values)
 
             if violations == 0:
                 continue
@@ -137,16 +151,16 @@ class VolumeCellQualityComputation(BaseOperation):
                     'violation_count': violations,
                     'total_cells': total,
                     'violation_rate': violation_rate,
-                    'mean': float(np.mean(values)),
-                    'min': float(np.min(values)),
-                    'max': float(np.max(values)),
-                    'std': float(np.std(values)),
+                    'mean': float(np.mean(valid_values)),
+                    'min': float(np.min(valid_values)),
+                    'max': float(np.max(valid_values)),
+                    'std': float(np.std(valid_values)),
                     'threshold': threshold,
                 },
                 metadata={
                     'quality_type': quality_type,
-                    'p5': float(np.percentile(values, 5)),
-                    'p95': float(np.percentile(values, 95)),
+                    'p5': float(np.percentile(valid_values, 5)),
+                    'p95': float(np.percentile(valid_values, 95)),
                 },
                 locations=locations,
             )

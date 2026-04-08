@@ -2,12 +2,38 @@
 Mesh loading utilities with format support.
 """
 
+import os
 from pathlib import Path
-from typing import Optional, Union, Dict, Any
+from typing import List, Optional, Union, Dict, Any
 import numpy as np
 
 from ..core.models import MeshInput
 from ..core.exceptions import MeshLoadError, UnsupportedFormatError
+
+
+def _validate_mesh_arrays(vertices: np.ndarray, faces: np.ndarray) -> None:
+    """Validate vertex and face arrays after loading.
+
+    Raises:
+        MeshLoadError: If arrays are empty, malformed, or contain invalid indices.
+    """
+    if len(vertices) == 0:
+        raise MeshLoadError("Loaded mesh has no vertices")
+    if vertices.ndim != 2 or vertices.shape[1] != 3:
+        raise MeshLoadError(
+            f"Vertices must be Nx3, got shape {vertices.shape}"
+        )
+    if len(faces) == 0:
+        raise MeshLoadError("Loaded mesh has no faces")
+    if faces.ndim != 2 or faces.shape[1] < 3:
+        raise MeshLoadError(
+            f"Faces must be NxK with K>=3, got shape {faces.shape}"
+        )
+    max_idx = int(faces.max())
+    if max_idx >= len(vertices):
+        raise MeshLoadError(
+            f"Face index {max_idx} exceeds vertex count {len(vertices)}"
+        )
 
 
 # Format to library support mapping
@@ -98,6 +124,7 @@ def load_mesh_from_file(
     mesh_id: Optional[str] = None,
     library: Optional[str] = None,
     extract_volume_cells: bool = True,
+    allowed_dirs: Optional[List[Union[str, Path]]] = None,
     **kwargs
 ) -> MeshInput:
     """
@@ -110,6 +137,8 @@ def load_mesh_from_file(
                 If None, first available library is used
         extract_volume_cells: If True, extract volumetric cells for 3D meshes
                 (requires meshio for best support)
+        allowed_dirs: Optional list of directories that mesh files may be loaded from.
+                If provided, file_path must resolve to a location under one of these dirs.
         **kwargs: Additional library-specific arguments
 
     Returns:
@@ -119,8 +148,17 @@ def load_mesh_from_file(
         FileNotFoundError: If file does not exist
         UnsupportedFormatError: If file format is not supported
         MeshLoadError: If mesh cannot be loaded
+        ValueError: If file_path is outside allowed directories
     """
-    file_path = Path(file_path)
+    file_path = Path(file_path).resolve()
+
+    if allowed_dirs is not None:
+        resolved_allowed = [Path(d).resolve() for d in allowed_dirs]
+        if not any(str(file_path).startswith(str(d) + os.sep) or str(file_path) == str(d) for d in resolved_allowed):
+            raise ValueError(
+                f"File '{file_path}' is outside allowed directories: "
+                f"{[str(d) for d in resolved_allowed]}"
+            )
 
     if not file_path.exists():
         raise FileNotFoundError(f"Mesh file not found: {file_path}")
@@ -137,19 +175,21 @@ def load_mesh_from_file(
     if suffix in ('.nas', '.bdf'):
         from .nas_parser import parse_nas
         try:
-            vertices, faces = parse_nas(str(file_path))
+            vertices, faces, volume_cells = parse_nas(str(file_path))
         except Exception as e:
             raise MeshLoadError(
                 f"Failed to parse NASTRAN file {file_path}: {e}"
             ) from e
 
+        _validate_mesh_arrays(vertices, faces)
         mesh_id = mesh_id or file_path.stem
         return MeshInput(
             vertices=vertices,
             faces=faces,
             mesh_id=mesh_id,
             source_format='nas',
-            file_path=str(file_path)
+            file_path=str(file_path),
+            volume_cells=volume_cells if volume_cells else None,
         )
 
     # Determine library to use
@@ -186,11 +226,12 @@ def load_mesh_from_file(
         from ..adapters.factory import get_adapter
         adapter = get_adapter(selected_library)
 
-        # Special handling for meshio to extract volumetric cells
-        if selected_library == 'meshio' and extract_volume_cells:
-            meshio_adapter = adapter
-            native_mesh = meshio_adapter.load_mesh(str(file_path), **kwargs)
-            mesh_input = meshio_adapter.to_canonical(
+        native_mesh = adapter.load_mesh(str(file_path), **kwargs)
+
+        if extract_volume_cells:
+            # Delegate to the adapter's to_canonical() which handles
+            # both surface and volumetric meshes appropriately.
+            mesh_input = adapter.to_canonical(
                 native_mesh,
                 mesh_id=mesh_id or file_path.stem
             )
@@ -198,18 +239,18 @@ def load_mesh_from_file(
             mesh_input.source_format = suffix[1:]
             return mesh_input
 
-        # Standard loading for other libraries
-        native_mesh = adapter.load_mesh(str(file_path), **kwargs)
+        # Surface-only fast path (skip volume cells)
         vertices = adapter.get_vertices(native_mesh)
         faces = adapter.get_faces(native_mesh)
 
+        _validate_mesh_arrays(vertices, faces)
         mesh_id = mesh_id or file_path.stem
 
         return MeshInput(
             vertices=vertices,
             faces=faces,
             mesh_id=mesh_id,
-            source_format=suffix[1:],  # Remove leading dot
+            source_format=suffix[1:],
             file_path=str(file_path)
         )
 
@@ -245,6 +286,7 @@ def create_mesh_from_arrays(
     vertices = np.array(vertices) if not isinstance(vertices, np.ndarray) else vertices
     faces = np.array(faces) if not isinstance(faces, np.ndarray) else faces
 
+    _validate_mesh_arrays(vertices, faces)
     mesh_id = mesh_id or f"mesh_{id(vertices)}"
 
     return MeshInput(

@@ -302,7 +302,7 @@ class TestQualityMetrics:
         vals = np.array([0.5, 0.8, 0.3, 0.95])
         qm = QualityMetrics(
             operation_id="op_q1",
-            metric_name="aspect_ratio",
+            metric_name="scaled_jacobian",
             values=vals,
             threshold=0.4,
         )
@@ -311,7 +311,7 @@ class TestQualityMetrics:
         assert qm.statistics["mean"] == pytest.approx(np.mean([0.5, 0.8, 0.3, 0.95]))
         assert qm.statistics["median"] == pytest.approx(np.median([0.5, 0.8, 0.3, 0.95]))
         assert qm.statistics["std"] == pytest.approx(np.std([0.5, 0.8, 0.3, 0.95]))
-        # 0.3 < 0.4 -> 1 violation
+        # scaled_jacobian is lower-is-worse: 0.3 < 0.4 -> 1 violation
         assert qm.violation_count == 1
 
     def test_list_input_converted_to_ndarray(self):

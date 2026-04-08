@@ -17,6 +17,12 @@ from .core.models import (
     MeshDimensionality,
     OperationConfig,
 )
+
+# Import the operations package — this triggers operations/__init__.py
+# which imports subpackages (topological, quality, volumetric) to
+# self-register all built-in operations into the registry.
+from . import operations  # noqa: F401
+
 from .operations.operation_registry import registry
 from .operations.base import register_operation
 

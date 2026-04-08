@@ -12,10 +12,16 @@ import numpy as np
 
 # Element type name -> number of nodes
 ELEMENT_NODE_COUNT: Dict[str, int] = {
+    # Linear elements
     'tet4': 4,
     'hex8': 8,
     'prism6': 6,
     'pyramid5': 5,
+    # Quadratic elements
+    'tet10': 10,
+    'hex20': 20,
+    'prism15': 15,
+    'pyramid13': 13,
 }
 
 # Reverse map: node count -> default element type name
@@ -40,10 +46,16 @@ def get_cell_type_map() -> Dict[str, int]:
         try:
             import pyvista as pv
             _CELL_TYPE_MAP = {
+                # Linear elements
                 'tet4': pv.CellType.TETRA,
                 'hex8': pv.CellType.HEXAHEDRON,
                 'prism6': pv.CellType.WEDGE,
                 'pyramid5': pv.CellType.PYRAMID,
+                # Quadratic elements
+                'tet10': pv.CellType.QUADRATIC_TETRA,
+                'hex20': pv.CellType.QUADRATIC_HEXAHEDRON,
+                'prism15': pv.CellType.QUADRATIC_WEDGE,
+                'pyramid13': pv.CellType.QUADRATIC_PYRAMID,
             }
         except ImportError as e:
             raise ImportError(

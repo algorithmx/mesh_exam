@@ -51,11 +51,15 @@ class NonManifoldEdgeDetection(BaseOperation):
         # Build edge-to-face adjacency
         edge_faces = self._build_edge_face_map(mesh)
 
-        # Find edges with != 2 incident faces
+        # Find edges with > 2 incident faces (true non-manifold)
+        # Boundary edges (1 face) are normal for open surfaces
         nonmanifold_edges = []
+        boundary_edges = []
         for edge, faces in edge_faces.items():
-            if len(faces) != 2:
+            if len(faces) > 2:
                 nonmanifold_edges.append((edge, len(faces), faces))
+            elif len(faces) == 1:
+                boundary_edges.append((edge, len(faces), faces))
 
         if not nonmanifold_edges:
             return []

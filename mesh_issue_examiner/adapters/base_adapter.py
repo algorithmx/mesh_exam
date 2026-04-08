@@ -24,6 +24,7 @@ Example:
     ...     # Implement all abstract methods...
 """
 
+import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Tuple, Optional, TYPE_CHECKING
 
@@ -31,6 +32,8 @@ import numpy as np
 
 if TYPE_CHECKING:
     from ..core.models import MeshInput
+
+logger = logging.getLogger(__name__)
 
 
 class MeshAdapter(ABC):
@@ -335,27 +338,51 @@ class MeshAdapter(ABC):
     # Conversion Methods
     # ======================================================================
 
+    def get_volume_cells(self, mesh: Any) -> Dict[str, np.ndarray]:
+        """Extract volumetric cells from a library-specific mesh.
+
+        Adapters that support volumetric meshes (VOLUMETRIC_MESH capability)
+        must override this method to return a dict mapping element type
+        names (e.g., 'tet4', 'hex8') to NxK connectivity arrays.
+
+        The default implementation returns an empty dict, suitable for
+        surface-only adapters.
+
+        Args:
+            mesh: Library-specific mesh object
+
+        Returns:
+            Dict mapping element type name -> NxK connectivity array.
+            Empty dict if the mesh has no volumetric cells or the
+            adapter does not support volumetric meshes.
+        """
+        return {}
+
     def to_canonical(self, mesh: Any, mesh_id: str = "") -> 'MeshInput':
         """Convert library mesh to canonical format.
-        
-        This default implementation creates a MeshInput from vertices
-        and faces. Adapters that support volumetric meshes should
-        override this to also extract volume_cells.
-        
+
+        This default implementation creates a MeshInput from vertices,
+        faces, and volume cells (if any). Adapters that need special
+        handling (e.g. surface extraction from UnstructuredGrid) should
+        override this method.
+
         Args:
             mesh: Library-specific mesh object
             mesh_id: Optional mesh identifier
-            
+
         Returns:
             MeshInput in canonical format
         """
         from ..core.models import MeshInput
 
+        volume_cells = self.get_volume_cells(mesh)
+
         return MeshInput(
             vertices=self.get_vertices(mesh),
             faces=self.get_faces(mesh),
             mesh_id=mesh_id,
-            source_format=self.library_name
+            source_format=self.library_name,
+            volume_cells=volume_cells if volume_cells else None,
         )
 
     def from_canonical(self, mesh_input: 'MeshInput') -> Any:
@@ -412,8 +439,9 @@ class MeshAdapter(ABC):
         for metric in metrics:
             try:
                 results[metric] = self.compute_cell_quality(mesh, metric)
-            except Exception:
-                # Silently skip metrics that fail
+            except Exception as e:
+                # Log the exception for debugging but continue with other metrics
+                logger.debug(f"Quality metric '{metric}' failed: {e}")
                 results[metric] = np.array([])
 
         return results

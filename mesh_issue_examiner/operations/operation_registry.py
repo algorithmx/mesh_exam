@@ -273,5 +273,7 @@ class OperationRegistry:
         return iter(self._operations.values())
 
 
-# Module-level registry instance
+# Module-level registry instance — the primary singleton used by
+# concrete operations at import time (e.g. registry.register(MyOp()).
+# For the lazy accessor used by base.register_operation(), see _registry.py.
 registry = OperationRegistry()

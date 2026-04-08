@@ -5,7 +5,9 @@ This module provides the main server class that handles MCP protocol
 communications and routes requests to appropriate operations.
 """
 
+import os
 import time
+from pathlib import Path
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 
@@ -17,14 +19,6 @@ from ..core.models import (
 )
 from ..operations.operation_registry import registry
 from ..utils.mesh_loader import load_mesh_from_file
-
-# Ensure built-in operations are imported so they self-register at module level
-from ..operations.topological import nonmanifold_edges as _  # noqa: F401
-from ..operations.quality import cell_quality as _  # noqa: F401
-from ..operations.volumetric import volume_cell_quality as _  # noqa: F401
-from ..operations.volumetric import geometric_validity as _  # noqa: F401
-from ..operations.volumetric import orientation_consistency as _  # noqa: F401
-from ..operations.volumetric import nonmanifold_faces as _  # noqa: F401
 
 
 @dataclass
@@ -293,11 +287,17 @@ class MeshIssueExaminerServer:
     async def _handle_load(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Handle mesh load request."""
         file_path = params['file_path']
+
+        # Resolve and validate path to prevent traversal attacks
+        resolved = Path(file_path).resolve()
+        if not resolved.exists():
+            raise FileNotFoundError(f"Mesh file not found: {resolved}")
+
         mesh_id = params.get('mesh_id')
         library = params.get('library')
 
         mesh_input = load_mesh_from_file(
-            file_path,
+            resolved,
             mesh_id=mesh_id,
             library=library
         )
@@ -329,6 +329,12 @@ class MeshIssueExaminerServer:
         if operations == ['all'] or operations == 'all':
             op_ids = None  # Will use all registered
         else:
+            # Validate operation IDs
+            available_ops = {op.operation_id for op in registry.list_all()}
+            invalid_ops = [op for op in operations if op not in available_ops]
+            if invalid_ops:
+                raise ValueError(f"Unknown operation(s): {', '.join(invalid_ops)}. "
+                               f"Use 'list_operations' to see available operations.")
             op_ids = operations
 
         # Create and execute workflow
@@ -364,13 +370,18 @@ class MeshIssueExaminerServer:
         mesh_id = params.get('mesh_id')
 
         if mesh_id:
-            self._mesh_cache.pop(mesh_id, None)
+            mesh = self._mesh_cache.pop(mesh_id, None)
+            if mesh is not None and hasattr(mesh, 'invalidate_cache'):
+                mesh.invalidate_cache()
             self._result_cache.pop(mesh_id, None)
             cleared = [mesh_id]
         else:
+            for mesh in self._mesh_cache.values():
+                if hasattr(mesh, 'invalidate_cache'):
+                    mesh.invalidate_cache()
+            cleared = list(self._mesh_cache.keys())
             self._mesh_cache.clear()
             self._result_cache.clear()
-            cleared = list(self._mesh_cache.keys()) if hasattr(self, '_mesh_cache') else []
 
         return {'status': 'cleared', 'cleared_ids': cleared}
 

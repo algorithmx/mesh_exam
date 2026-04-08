@@ -3,6 +3,9 @@ Orientation and consistency check operation for volumetric (3D) meshes.
 
 Detects inverted elements (negative volume) and inconsistent face winding
 in volumetric mesh cells, which cause solver failures and incorrect results.
+
+Supports all linear element types: tet4, hex8, prism6, pyramid5, and
+mixed-element meshes.
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -18,6 +21,7 @@ from ...core.models import (
 )
 from ..base import BaseOperation, OperationMetadata
 from ..operation_registry import registry
+from ._face_tables import ELEMENT_FACES
 
 
 class OrientationConsistencyCheck(BaseOperation):
@@ -33,11 +37,11 @@ class OrientationConsistencyCheck(BaseOperation):
        the face vertices should appear in opposite order in the two cells.
        If both cells list the face with the same vertex order the winding is
        inconsistent, leading to assembly errors in FEA/CFD.
+
+    Supports tet4, hex8, prism6, pyramid5, and mixed-element meshes.
     """
 
     # Maximum number of IssueLocation objects per issue (avoids huge reports).
-    # This cap prevents excessive memory usage and report size when processing
-    # large meshes with widespread orientation issues.
     _MAX_LOCATIONS = 100
 
     def __init__(self, config: Optional[OperationConfig] = None):
@@ -60,7 +64,8 @@ class OrientationConsistencyCheck(BaseOperation):
             requires_adjacency=True,
             complexity='O(n log n)',
             tags=['orientation', 'volumetric', '3d', 'inverted',
-                  'winding', 'consistency'],
+                  'winding', 'consistency', 'tet4', 'hex8',
+                  'prism6', 'pyramid5'],
         )
 
     # ------------------------------------------------------------------
@@ -115,7 +120,6 @@ class OrientationConsistencyCheck(BaseOperation):
                     quality_measure='volume'
                 ).cell_data['volume']
             except Exception:
-                # Fall back to manual signed-volume computation for tet4 cells
                 volumes = self._compute_signed_volumes(mesh)
 
         if volumes is None or len(volumes) == 0:
@@ -160,22 +164,23 @@ class OrientationConsistencyCheck(BaseOperation):
     def _check_winding_consistency(self, mesh: MeshInput) -> List[MeshIssue]:
         """Check that shared faces have opposite winding in adjacent cells.
 
-        Only tet4 cells are analysed because they have a well-defined set of
-        four triangular faces.  For each internal face shared by exactly two
-        cells the oriented face tuples must be reverses of each other.  If
-        they are identical the winding is inconsistent.
+        Works for all element types (tet4, hex8, prism6, pyramid5) and
+        mixed-element meshes.  Uses the directed-edge method to compare
+        winding: for each shared face, every directed edge (u->v) from one
+        cell must appear as (v->u) in the adjacent cell.
         """
-        tet_cells = mesh.volume_cells.get('tet4', np.empty((0, 4), dtype=int))
-        if tet_cells.ndim != 2 or tet_cells.shape[0] == 0:
+        face_to_cells = self._build_face_to_cell_map(mesh)
+        if not face_to_cells:
             return []
 
-        face_to_cells = self._build_face_to_cell_map(tet_cells)
-
         inconsistent_cells: set = set()
+        total_shared_faces = 0
+
         for _key, entries in face_to_cells.items():
             # Only check internal faces (shared by exactly 2 cells)
             if len(entries) != 2:
                 continue
+            total_shared_faces += 1
             (cell_a, face_a), (cell_b, face_b) = entries[0], entries[1]
             if not self._faces_are_reversed(face_a, face_b):
                 inconsistent_cells.add(cell_a)
@@ -183,6 +188,11 @@ class OrientationConsistencyCheck(BaseOperation):
 
         if not inconsistent_cells:
             return []
+
+        # Compute total cell count across all element types
+        total_cells = sum(
+            len(conn) for conn in mesh.volume_cells.values()
+        )
 
         sorted_cells = sorted(inconsistent_cells)
         locations = [
@@ -204,7 +214,8 @@ class OrientationConsistencyCheck(BaseOperation):
             locations=locations,
             metrics={
                 'inconsistent_winding_cells': float(len(sorted_cells)),
-                'total_tet_cells': float(tet_cells.shape[0]),
+                'total_shared_faces': float(total_shared_faces),
+                'total_cells': float(total_cells),
             },
         )
         return [issue]
@@ -215,85 +226,220 @@ class OrientationConsistencyCheck(BaseOperation):
 
     @staticmethod
     def _build_face_to_cell_map(
-        tet_cells: np.ndarray,
-    ) -> Dict[Tuple[int, ...], List[Tuple[int, Tuple[int, int, int]]]]:
+        mesh: MeshInput,
+    ) -> Dict[Tuple[int, ...], List[Tuple[int, Tuple[int, ...]]]]:
         """Build mapping from sorted face tuples to (cell_idx, oriented_face).
 
-        For each tet cell ``(a, b, c, d)`` the four triangular faces are:
-        ``(a, b, c)``, ``(a, c, d)``, ``(a, d, b)``, ``(b, d, c)``.
+        Iterates over all element types in ``mesh.volume_cells``.  For each
+        cell, extracts faces using the :data:`ELEMENT_FACES` table and
+        creates a canonical key by sorting vertex indices.  The original
+        (oriented) face tuple is stored alongside the global cell index so
+        that winding can be compared later.
 
-        The dict key is the *sorted* face tuple so that differently-oriented
-        but geometrically identical faces map to the same entry.
+        Args:
+            mesh: Input mesh with volumetric cells.
+
+        Returns:
+            Dictionary mapping sorted face tuples to lists of
+            ``(global_cell_index, oriented_face_tuple)`` pairs.
         """
         face_to_cells: Dict[
             Tuple[int, ...],
-            List[Tuple[int, Tuple[int, int, int]]],
+            List[Tuple[int, Tuple[int, ...]]],
         ] = {}
 
-        for cell_idx in range(tet_cells.shape[0]):
-            a, b, c, d = tet_cells[cell_idx]
-            faces = [(a, b, c), (a, c, d), (a, d, b), (b, d, c)]
-            for face in faces:
-                key = tuple(sorted(face))
-                if key not in face_to_cells:
-                    face_to_cells[key] = []
-                face_to_cells[key].append((cell_idx, face))
+        global_cell_idx = 0
+
+        for element_type, connectivity in mesh.volume_cells.items():
+            if element_type not in ELEMENT_FACES:
+                # Skip unknown element types but advance global index
+                global_cell_idx += len(connectivity)
+                continue
+
+            face_defs = ELEMENT_FACES[element_type]
+            n_cells = len(connectivity)
+
+            for local_idx in range(n_cells):
+                cell_verts = connectivity[local_idx]
+
+                for face_def in face_defs:
+                    face = tuple(int(cell_verts[i]) for i in face_def)
+                    key = tuple(sorted(face))
+                    face_to_cells.setdefault(key, []).append(
+                        (global_cell_idx, face)
+                    )
+
+                global_cell_idx += 1
 
         return face_to_cells
 
     @staticmethod
     def _faces_are_reversed(
-        face_a: Tuple[int, int, int],
-        face_b: Tuple[int, int, int],
+        face_a: Tuple[int, ...],
+        face_b: Tuple[int, ...],
     ) -> bool:
-        """Return True if *face_b* is the reverse winding of *face_a*.
+        """Return True if *face_b* has opposite winding to *face_a*.
 
-        Two triangular faces are reverses when ``face_b`` equals
-        ``(face_a[0], face_a[2], face_a[1])`` or either cyclic
-        rotation of that reversed ordering.
+        Uses the **directed-edge method**: for opposite winding, every
+        directed edge ``(u, v)`` in ``face_a`` must appear as ``(v, u)``
+        in ``face_b``.  This works uniformly for triangular and
+        quadrilateral faces.
         """
-        # The reverse of (x, y, z) is (x, z, y).
-        # The three cyclic rotations of the reverse are:
-        rev = (face_a[0], face_a[2], face_a[1])
-        cyclic = [
-            rev,
-            (rev[1], rev[2], rev[0]),
-            (rev[2], rev[0], rev[1]),
-        ]
-        return face_b in cyclic
+        n = len(face_a)
+        # Collect directed edges from face_b into a set for O(1) lookup
+        edges_b = {(face_b[i], face_b[(i + 1) % n]) for i in range(n)}
+        # Every edge in face_a must have its reverse in face_b
+        return all(
+            (face_a[(i + 1) % n], face_a[i]) in edges_b
+            for i in range(n)
+        )
 
     @staticmethod
     def _compute_signed_volumes(mesh: MeshInput) -> Optional[np.ndarray]:
-        """Compute signed volumes for tet4 cells using the determinant formula.
+        """Compute signed volumes for all volumetric cells.
 
-        For a tet with vertices v0, v1, v2, v3:
-            V = det([v1-v0, v2-v0, v3-v0]) / 6
+        For tet4 cells, uses the determinant formula directly.
+        For hex8, prism6, pyramid5, decomposes each cell into tetrahedra
+        and sums the signed volumes.
 
-        Returns None if there are no tet4 cells.
+        Returns:
+            1D array of signed volumes (one per cell, in global order),
+            or None if there are no volumetric cells.
         """
-        tet_cells = mesh.volume_cells.get('tet4')
-        if tet_cells is None or len(tet_cells) == 0:
+        if not mesh.has_volume_cells:
             return None
 
         verts = mesh.vertices  # (N, 3)
-        v0 = verts[tet_cells[:, 0]]  # (M, 3)
-        v1 = verts[tet_cells[:, 1]]
-        v2 = verts[tet_cells[:, 2]]
-        v3 = verts[tet_cells[:, 3]]
+        all_volumes: List[float] = []
 
-        # Columns of the 3x3 Jacobian for each cell
+        for element_type, connectivity in mesh.volume_cells.items():
+            n_cells = len(connectivity)
+            if n_cells == 0:
+                continue
+
+            if element_type == 'tet4':
+                vol = _signed_volume_tet4(verts, connectivity)
+                all_volumes.extend(vol.tolist())
+
+            elif element_type == 'hex8':
+                for i in range(n_cells):
+                    cell = connectivity[i]
+                    all_volumes.append(
+                        _signed_volume_decomposed(verts, cell, _HEX8_TETS)
+                    )
+
+            elif element_type == 'prism6':
+                for i in range(n_cells):
+                    cell = connectivity[i]
+                    all_volumes.append(
+                        _signed_volume_decomposed(verts, cell, _PRISM6_TETS)
+                    )
+
+            elif element_type == 'pyramid5':
+                for i in range(n_cells):
+                    cell = connectivity[i]
+                    all_volumes.append(
+                        _signed_volume_decomposed(verts, cell, _PYRAMID5_TETS)
+                    )
+
+            else:
+                # Unknown type — skip (will be 0 volume)
+                all_volumes.extend([0.0] * n_cells)
+
+        if not all_volumes:
+            return None
+
+        return np.array(all_volumes)
+
+
+# Tetrahedral decompositions for signed-volume computation.
+# Each sub-list contains 4 local vertex indices forming a tet.
+# The decomposition covers the full cell without overlap.
+
+# hex8 → 5 tets (using vertex 0 as hub)
+_HEX8_TETS = [
+    (0, 1, 3, 4),
+    (1, 2, 3, 6),
+    (1, 4, 5, 6),
+    (3, 4, 6, 7),
+    (1, 3, 4, 6),
+]
+
+# prism6 → 3 tets
+_PRISM6_TETS = [
+    (0, 1, 2, 3),
+    (1, 2, 3, 4),
+    (2, 3, 4, 5),
+]
+
+# pyramid5 → 2 tets (using the quad diagonal)
+_PYRAMID5_TETS = [
+    (0, 1, 3, 4),
+    (1, 2, 3, 4),
+]
+
+
+def _signed_volume_tet4(
+    verts: np.ndarray,
+    connectivity: np.ndarray,
+) -> np.ndarray:
+    """Vectorised signed volume for tet4 cells.
+
+    For a tet with vertices v0, v1, v2, v3:
+        V = det([v1-v0, v2-v0, v3-v0]) / 6
+    """
+    v0 = verts[connectivity[:, 0]]
+    v1 = verts[connectivity[:, 1]]
+    v2 = verts[connectivity[:, 2]]
+    v3 = verts[connectivity[:, 3]]
+
+    e1 = v1 - v0
+    e2 = v2 - v0
+    e3 = v3 - v0
+
+    vol = (
+        e1[:, 0] * (e2[:, 1] * e3[:, 2] - e2[:, 2] * e3[:, 1])
+        - e1[:, 1] * (e2[:, 0] * e3[:, 2] - e2[:, 2] * e3[:, 0])
+        + e1[:, 2] * (e2[:, 0] * e3[:, 1] - e2[:, 1] * e3[:, 0])
+    ) / 6.0
+
+    return vol
+
+
+def _signed_volume_decomposed(
+    verts: np.ndarray,
+    cell: np.ndarray,
+    tet_defs: list,
+) -> float:
+    """Signed volume for a cell decomposed into tetrahedra.
+
+    Args:
+        verts: (N, 3) vertex array.
+        cell: 1D array of global vertex IDs for the cell.
+        tet_defs: List of 4-tuples of local vertex indices.
+
+    Returns:
+        Sum of signed volumes of the sub-tetrahedra.
+    """
+    total = 0.0
+    for tet_def in tet_defs:
+        v0 = verts[cell[tet_def[0]]]
+        v1 = verts[cell[tet_def[1]]]
+        v2 = verts[cell[tet_def[2]]]
+        v3 = verts[cell[tet_def[3]]]
+
         e1 = v1 - v0
         e2 = v2 - v0
         e3 = v3 - v0
 
-        # Scalar triple product = det([e1|e2|e3])
         vol = (
-            e1[:, 0] * (e2[:, 1] * e3[:, 2] - e2[:, 2] * e3[:, 1])
-            - e1[:, 1] * (e2[:, 0] * e3[:, 2] - e2[:, 2] * e3[:, 0])
-            + e1[:, 2] * (e2[:, 0] * e3[:, 1] - e2[:, 1] * e3[:, 0])
+            e1[0] * (e2[1] * e3[2] - e2[2] * e3[1])
+            - e1[1] * (e2[0] * e3[2] - e2[2] * e3[0])
+            + e1[2] * (e2[0] * e3[1] - e2[1] * e3[0])
         ) / 6.0
+        total += vol
 
-        return vol
+    return total
 
 
 # Register operation

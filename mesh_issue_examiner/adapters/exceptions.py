@@ -5,12 +5,15 @@ This module defines a hierarchy of exceptions that adapters can raise
 to provide clear, actionable error messages to users.
 """
 
+from ..core.exceptions import MeshExaminerError
 
-class AdapterError(Exception):
+
+class AdapterError(MeshExaminerError):
     """Base exception for all adapter-related errors.
-    
+
     All adapter exceptions should inherit from this class to allow
-catch-all error handling by users.
+catch-all error handling by users. Inherits from MeshExaminerError
+so that catching MeshExaminerError also catches adapter errors.
     """
     pass
 

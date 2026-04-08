@@ -16,18 +16,21 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 
-def parse_nas(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
+def parse_nas(file_path: str) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
     """
-    Parse a NASTRAN BDF/NAS file into surface mesh arrays.
+    Parse a NASTRAN BDF/NAS file into surface mesh arrays and volumetric cells.
 
-    Volume elements (CTETRA) are decomposed into triangular faces and
-    internal (shared) faces are removed to produce the boundary surface.
+    Volume elements (CTETRA) are decomposed into triangular faces for the
+    boundary surface, and their raw node connectivity is preserved in
+    ``volume_cells`` for volumetric analysis.
 
     Args:
         file_path: Path to .nas or .bdf file.
 
     Returns:
-        Tuple of (vertices_Nx3, faces_Mx3) as numpy arrays.
+        Tuple of (vertices_Nx3, faces_Mx3, volume_cells) where
+        volume_cells maps element type names to NxK connectivity arrays
+        (e.g. {'tet4': np.array(...)}). Empty dict if no volumetric elements.
 
     Raises:
         ValueError: If no GRID or no element cards are found.
@@ -35,6 +38,7 @@ def parse_nas(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
     nodes: Dict[int, Tuple[float, float, float]] = {}
     surface_faces: List[Tuple[int, int, int]] = []
     volume_faces: List[Tuple[int, int, int]] = []
+    volume_cells_raw: Dict[str, List[List[int]]] = {}
 
     in_bulk = False
     with open(file_path, 'r') as f:
@@ -81,9 +85,11 @@ def parse_nas(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
                     surface_faces.extend(tris)
 
             elif keyword == 'CTETRA':
-                tris = _parse_ctetra(fields)
-                if tris:
+                result = _parse_ctetra_volumetric(fields)
+                if result is not None:
+                    tris, cell_nodes = result
                     volume_faces.extend(tris)
+                    volume_cells_raw.setdefault('tet4', []).append(cell_nodes)
 
     if not nodes:
         raise ValueError(f"No GRID cards found in {file_path}")
@@ -96,11 +102,13 @@ def parse_nas(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
         boundary_faces = _extract_boundary_faces(volume_faces)
         surface_faces.extend(boundary_faces)
 
-    # Re-map node IDs to contiguous 0-based indices
-    # Only keep nodes referenced by faces
+    # Collect all used node IDs (from faces and volume cells)
     used_nodes = set()
     for face in surface_faces:
         used_nodes.update(face)
+    for cells in volume_cells_raw.values():
+        for cell in cells:
+            used_nodes.update(cell)
 
     id_map = {old_id: new_idx for new_idx, old_id in enumerate(sorted(used_nodes))}
 
@@ -114,7 +122,15 @@ def parse_nas(file_path: str) -> Tuple[np.ndarray, np.ndarray]:
         dtype=np.int64
     )
 
-    return vertices, faces
+    # Remap volume cell node IDs
+    volume_cells: Dict[str, np.ndarray] = {}
+    for etype, cells in volume_cells_raw.items():
+        volume_cells[etype] = np.array(
+            [[id_map[n] for n in cell] for cell in cells],
+            dtype=np.int64
+        )
+
+    return vertices, faces, volume_cells
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +208,25 @@ def _parse_ctetra(fields: List[str]) -> List[Tuple[int, int, int]] | None:
             (g1, g3, g4),
             (g2, g3, g4),
         ]
+    except (IndexError, ValueError):
+        return None
+
+
+def _parse_ctetra_volumetric(fields: List[str]) -> tuple | None:
+    """Parse CTETRA card returning both surface decomposition and raw connectivity.
+
+    Returns:
+        Tuple of (triangular_faces, [g1, g2, g3, g4]) or None on parse error.
+    """
+    try:
+        g1, g2, g3, g4 = int(fields[3]), int(fields[4]), int(fields[5]), int(fields[6])
+        faces = [
+            (g1, g2, g3),
+            (g1, g2, g4),
+            (g1, g3, g4),
+            (g2, g3, g4),
+        ]
+        return faces, [g1, g2, g3, g4]
     except (IndexError, ValueError):
         return None
 

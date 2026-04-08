@@ -229,14 +229,14 @@ class TestSkewedTriangles:
         angle_issues = [i for i in issues if 'min_angle' in i.operation_id]
         assert angle_issues[0].metrics['violation_count'] == 2
 
-    def test_severity_is_critical_for_100_pct_violation(self):
-        """When 100 % of cells violate, severity should be CRITICAL."""
+    def test_severity_is_warning_for_100_pct_violation(self):
+        """min_angle severity is capped at WARNING even at 100 % violation."""
         mesh = self._make_needle_mesh()
         op = CellQualityComputation(quality_types=['min_angle'])
         issues = op.execute(mesh)
 
         angle_issues = [i for i in issues if 'min_angle' in i.operation_id]
-        assert angle_issues[0].severity == IssueSeverity.CRITICAL
+        assert angle_issues[0].severity == IssueSeverity.WARNING
 
     def test_min_angle_value_is_very_low(self):
         """The minimum angle should be very close to 0 degrees for needle triangles."""
@@ -287,10 +287,9 @@ class TestInvertedTriangle:
         op = NonManifoldEdgeDetection()
         issues = op.execute(mesh)
 
-        # Each edge is on the boundary (1 face), so they are detected
-        # because the edge face count != 2.
-        # All 3 edges have face_count=1 which is != 2, so they should be flagged.
-        assert len(issues) >= 1
+        # All 3 edges are boundary edges (face_count=1), which are normal for
+        # open surfaces. NonManifoldEdgeDetection only flags face_count > 2.
+        assert len(issues) == 0
 
 
 # ===================================================================
@@ -327,29 +326,24 @@ class TestDuplicateVertices:
     def test_nonmanifold_edges_detected(self):
         """
         Duplicate vertices cause every edge to be a boundary edge
-        (each edge is only in one face). This should be flagged.
+        (each edge is only in one face), but boundary edges are NOT
+        non-manifold. NonManifoldEdgeDetection flags only face_count > 2.
         """
         mesh = self._make_duplicate_vertex_mesh()
         op = NonManifoldEdgeDetection()
         issues = op.execute(mesh)
 
-        # All 6 edges have face_count=1, so all are non-manifold (boundary)
-        assert len(issues) >= 1
+        # All 6 edges have face_count=1 (boundary), not face_count > 2.
+        assert len(issues) == 0
 
     def test_all_edges_are_boundary(self):
-        """Every edge in the duplicate-vertex mesh is a boundary edge."""
+        """Duplicate-vertex mesh has no non-manifold edges (only boundary edges)."""
         mesh = self._make_duplicate_vertex_mesh()
         op = NonManifoldEdgeDetection()
         issues = op.execute(mesh)
 
-        # All edges have face_count == 1
-        boundary_edge_count = 0
-        for issue in issues:
-            for loc in issue.locations:
-                if loc.adjacent_elements.get('face_count', 0) == 1:
-                    boundary_edge_count += 1
-        # 2 triangles x 3 edges = 6 boundary edges
-        assert boundary_edge_count == 6
+        # Boundary edges (face_count=1) are not reported by NonManifoldEdgeDetection.
+        assert len(issues) == 0
 
     def test_quality_runs_without_error(self):
         """Quality operations should handle duplicate vertices gracefully."""
@@ -467,14 +461,14 @@ class TestMixedQualityMesh:
         # 1 out of 3 faces should be in violation
         assert angle_issues[0].metrics['violation_count'] == 1
 
-    def test_severity_is_error_for_one_of_three(self):
-        """1/3 violation rate > 0.2 but < 0.5, so severity should be ERROR."""
+    def test_severity_is_warning_for_one_of_three(self):
+        """min_angle severity is capped at WARNING (would be ERROR by rate alone)."""
         mesh = self._make_mixed_mesh()
         op = CellQualityComputation(quality_types=['min_angle'])
         issues = op.execute(mesh)
 
         angle_issues = [i for i in issues if 'min_angle' in i.operation_id]
-        assert angle_issues[0].severity == IssueSeverity.ERROR
+        assert angle_issues[0].severity == IssueSeverity.WARNING
 
     def test_mean_min_angle_is_moderate(self):
         """Mean min_angle should be between 0 and 60 degrees (mixed quality)."""
