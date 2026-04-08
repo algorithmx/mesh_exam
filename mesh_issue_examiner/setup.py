@@ -36,6 +36,7 @@ setup(
     python_requires=">=3.8",
     install_requires=[
         "numpy>=1.21.0",
+        "mcp>=1.0.0",
     ],
     extras_require={
         "trimesh": ["trimesh>=4.0.0"],

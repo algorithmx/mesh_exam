@@ -56,9 +56,9 @@ class TestMCPRequest:
         assert req.request_id is None
 
     def test_params_is_dict(self):
-        req = MCPRequest(method="list_operations", params={"category": "topological"})
+        req = MCPRequest(method="mesh_get_issues", params={"mesh_id": "test"})
         assert isinstance(req.params, dict)
-        assert req.params["category"] == "topological"
+        assert req.params["mesh_id"] == "test"
 
 
 class TestMCPResponse:
@@ -161,9 +161,9 @@ class TestMeshIssueExaminerServer:
         assert names == {
             "mesh_load",
             "mesh_inspect",
-            "mesh_get_result",
+            "mesh_get_issues",
+            "mesh_get_quality_metrics",
             "mesh_clear_cache",
-            "list_operations",
         }
 
     def test_handle_request_unknown_method_returns_error(self):
@@ -173,23 +173,6 @@ class TestMeshIssueExaminerServer:
         assert resp.error is not None
         assert resp.error["code"] == "unknown_method"
         assert "nonexistent_method" in resp.error["message"]
-
-    def test_list_operations_without_filter(self):
-        """list_operations with no category or library returns all registered ops."""
-        server = _make_server()
-        req = MCPRequest(method="list_operations", params={})
-        resp = asyncio.run(server.handle_request(req))
-        assert resp.error is None
-        assert isinstance(resp.result, list)
-
-    def test_list_operations_with_category_filter(self):
-        server = _make_server()
-        req = MCPRequest(
-            method="list_operations", params={"category": "topological"}
-        )
-        resp = asyncio.run(server.handle_request(req))
-        assert resp.error is None
-        assert isinstance(resp.result, list)
 
     def test_clear_cache(self):
         """Clearing cache without a mesh_id empties both caches."""
@@ -204,17 +187,43 @@ class TestMeshIssueExaminerServer:
         assert len(server._mesh_cache) == 0
         assert len(server._result_cache) == 0
 
-    def test_get_result_nonexistent_mesh_returns_error(self):
-        """handle_request catches ValueError from _handle_get_result and wraps it."""
+    def test_get_issues_nonexistent_mesh_returns_error(self):
+        """handle_request catches ValueError from _handle_get_issues and wraps it."""
         server = _make_server()
         req = MCPRequest(
-            method="mesh_get_result", params={"mesh_id": "does_not_exist"}
+            method="mesh_get_issues", params={"mesh_id": "does_not_exist"}
         )
         resp = asyncio.run(server.handle_request(req))
-        # The server catches all exceptions, so ValueError is wrapped into an error response
         assert resp.error is not None
         assert resp.error["type"] == "ValueError"
         assert "does_not_exist" in resp.error["message"]
+
+    def test_inspect_mutual_exclusion_categories_and_operations(self):
+        """Providing both categories and operations raises ValueError."""
+        server = _make_server()
+        req = MCPRequest(
+            method="mesh_inspect",
+            params={
+                "mesh_id": "any_id",
+                "categories": ["topological"],
+                "operations": ["topology.detect_nonmanifold_edges"],
+            },
+        )
+        resp = asyncio.run(server.handle_request(req))
+        assert resp.error is not None
+        assert resp.error["type"] == "ValueError"
+        assert "not both" in resp.error["message"]
+
+    def test_get_quality_metrics_nonexistent_mesh_returns_error(self):
+        """mesh_get_quality_metrics on unknown mesh_id returns error."""
+        server = _make_server()
+        req = MCPRequest(
+            method="mesh_get_quality_metrics", params={"mesh_id": "no_such_mesh"}
+        )
+        resp = asyncio.run(server.handle_request(req))
+        assert resp.error is not None
+        assert resp.error["type"] == "ValueError"
+        assert "no_such_mesh" in resp.error["message"]
 
     def test_inspect_nonexistent_mesh_returns_error(self):
         """handle_request catches ValueError from _handle_inspect and wraps it."""
@@ -247,9 +256,9 @@ class TestMeshIssueExaminerServer:
         assert names == {
             "mesh_load",
             "mesh_inspect",
-            "mesh_get_result",
+            "mesh_get_issues",
+            "mesh_get_quality_metrics",
             "mesh_clear_cache",
-            "list_operations",
         }
 
     def test_server_init_with_custom_config(self):

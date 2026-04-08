@@ -278,7 +278,7 @@ class PyVistaAdapter(MeshAdapter):
         if isinstance(mesh, pv.PolyData):
             faces = self.get_faces(mesh)
         elif isinstance(mesh, pv.UnstructuredGrid):
-            surf = mesh.extract_surface(algorithm='dataset_surface')
+            surf = mesh.extract_surface()
             if surf.n_cells > 0:
                 faces = self.get_faces(surf)
 

@@ -3,9 +3,17 @@ MCP server implementation for mesh issue examination.
 
 This module provides the main server class that handles MCP protocol
 communications and routes requests to appropriate operations.
+
+Two layers are provided:
+
+1. :class:`MeshIssueExaminerServer` – internal business-logic layer that
+   manages mesh loading, inspection workflows, and result caching.
+2. :func:`create_mcp_server` / :func:`main` – thin FastMCP wrapper that
+   exposes the business logic via the standard MCP protocol (JSON-RPC 2.0
+   over stdio / streamable-http).
 """
 
-import os
+import json
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Any
@@ -16,20 +24,26 @@ from ..core.models import (
     InspectionResult,
     OperationConfig,
     IssueCategory,
+    IssueSeverity,
 )
 from ..operations.operation_registry import registry
 from ..utils.mesh_loader import load_mesh_from_file
 
 
+# ---------------------------------------------------------------------------
+# Internal data classes (kept for backward compatibility & direct testing)
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class MCPRequest:
     """Represents an MCP protocol request.
-    
+
     The ``params`` field is intentionally typed as ``Dict[str, Any]`` to
     accommodate varying parameter schemas for different MCP methods.
     For type-safe access, validate parameters against the tool schemas
     returned by ``list_operations`` before processing.
-    
+
     Example:
         >>> request = MCPRequest(
         ...     method='mesh_load',
@@ -71,15 +85,21 @@ class MCPTool:
         }
 
 
+# ---------------------------------------------------------------------------
+# Business-logic server (transport-agnostic)
+# ---------------------------------------------------------------------------
+
+
 class MeshIssueExaminerServer:
     """
     MCP server for mesh issue examination.
 
     Provides tools for:
     - Loading meshes from files
-    - Running individual or composed inspection operations
-    - Retrieving inspection results
-    - Batch inspection workflows
+    - Running inspection operations (by category, by ID, or all)
+    - Retrieving filtered/paginated issues
+    - Retrieving quality metrics
+    - Cache management
 
     Usage:
         server = MeshIssueExaminerServer()
@@ -90,10 +110,10 @@ class MeshIssueExaminerServer:
             params={'file_path': 'example.stl'}
         ))
 
-        # Inspect the mesh
+        # Inspect the mesh (runs all operations by default)
         inspect_result = await server.handle_request(MCPRequest(
             method='mesh_inspect',
-            params={'mesh_id': 'example', 'operations': ['all']}
+            params={'mesh_id': 'example'}
         ))
     """
 
@@ -122,22 +142,27 @@ class MeshIssueExaminerServer:
         # Mesh load tool
         self._tools['mesh_load'] = MCPTool(
             name='mesh_load',
-            description='Load a mesh file and return mesh ID for subsequent operations',
+            description=(
+                'Load a mesh file for inspection. Reads a mesh from disk '
+                '(STL, OBJ, PLY, VTK, NAS, and 30+ other formats) and '
+                'stores it in the server cache. Returns mesh_id, vertex/face '
+                'counts, bounding box, and format.'
+            ),
             input_schema={
                 'type': 'object',
                 'properties': {
                     'file_path': {
                         'type': 'string',
-                        'description': 'Path to mesh file (STL, OBJ, PLY, etc.)'
+                        'description': 'Absolute path to the mesh file on the server filesystem.'
                     },
                     'mesh_id': {
                         'type': 'string',
-                        'description': 'Optional custom mesh ID'
+                        'description': 'Custom identifier. Defaults to filename stem.'
                     },
                     'library': {
                         'type': 'string',
                         'enum': ['trimesh', 'pyvista', 'pymeshlab'],
-                        'description': 'Preferred loading library'
+                        'description': 'Preferred loader. Auto-detected when omitted.'
                     }
                 },
                 'required': ['file_path']
@@ -147,18 +172,19 @@ class MeshIssueExaminerServer:
         # Mesh inspect tool
         self._tools['mesh_inspect'] = MCPTool(
             name='mesh_inspect',
-            description='Run mesh inspection operations',
+            description=(
+                'Execute inspection operations on a previously loaded mesh. '
+                'Provide ONE of categories or operations to run a subset; '
+                'omit both to run every registered operation. Returns summary '
+                'only — use mesh_get_issues and mesh_get_quality_metrics to '
+                'drill down.'
+            ),
             input_schema={
                 'type': 'object',
                 'properties': {
                     'mesh_id': {
                         'type': 'string',
-                        'description': 'Mesh ID from load operation'
-                    },
-                    'operations': {
-                        'type': 'array',
-                        'items': {'type': 'string'},
-                        'description': 'List of operation IDs, or ["all"] for all operations'
+                        'description': 'Identifier returned by mesh_load.'
                     },
                     'categories': {
                         'type': 'array',
@@ -166,27 +192,89 @@ class MeshIssueExaminerServer:
                             'type': 'string',
                             'enum': ['topological', 'geometric', 'quality', 'orientation']
                         },
-                        'description': 'Filter by category'
+                        'description': (
+                            'Run all operations in these categories. '
+                            'Mutually exclusive with operations.'
+                        )
+                    },
+                    'operations': {
+                        'type': 'array',
+                        'items': {'type': 'string'},
+                        'description': (
+                            'Run these specific operation IDs. '
+                            'Discover IDs via the mesh://operations resource. '
+                            'Mutually exclusive with categories.'
+                        )
                     }
                 },
                 'required': ['mesh_id']
             }
         )
 
-        # Get cached result
-        self._tools['mesh_get_result'] = MCPTool(
-            name='mesh_get_result',
-            description='Get cached inspection result',
+        # Get issues (replaces mesh_get_result)
+        self._tools['mesh_get_issues'] = MCPTool(
+            name='mesh_get_issues',
+            description=(
+                'Retrieve detected issues from a completed inspection. '
+                'Call after mesh_inspect. Supports filtering by severity '
+                'and category, and pagination to control response size.'
+            ),
             input_schema={
                 'type': 'object',
                 'properties': {
                     'mesh_id': {
                         'type': 'string',
-                        'description': 'Mesh ID'
+                        'description': 'Identifier from mesh_load.'
                     },
-                    'include_details': {
-                        'type': 'boolean',
-                        'description': 'Include detailed issue information'
+                    'severity': {
+                        'type': 'string',
+                        'enum': ['info', 'warning', 'error', 'critical'],
+                        'description': 'Filter by severity. Returns all when omitted.'
+                    },
+                    'category': {
+                        'type': 'string',
+                        'enum': ['topological', 'geometric', 'quality', 'orientation'],
+                        'description': 'Filter by category. Returns all when omitted.'
+                    },
+                    'limit': {
+                        'type': 'integer',
+                        'description': 'Max issues to return (1-200, default 50).',
+                        'default': 50,
+                        'minimum': 1,
+                        'maximum': 200
+                    },
+                    'offset': {
+                        'type': 'integer',
+                        'description': 'Skip this many issues for pagination.',
+                        'default': 0,
+                        'minimum': 0
+                    }
+                },
+                'required': ['mesh_id']
+            }
+        )
+
+        # Get quality metrics
+        self._tools['mesh_get_quality_metrics'] = MCPTool(
+            name='mesh_get_quality_metrics',
+            description=(
+                'Retrieve quality metrics from a completed inspection. '
+                'Call after mesh_inspect. Returns per-metric statistics '
+                '(min, max, mean, median, std, p5, p95) and violation counts.'
+            ),
+            input_schema={
+                'type': 'object',
+                'properties': {
+                    'mesh_id': {
+                        'type': 'string',
+                        'description': 'Identifier from mesh_load.'
+                    },
+                    'metric_name': {
+                        'type': 'string',
+                        'description': (
+                            'Specific metric to retrieve (e.g. "aspect_ratio", '
+                            '"scaled_jacobian"). Returns all metrics when omitted.'
+                        )
                     }
                 },
                 'required': ['mesh_id']
@@ -196,33 +284,19 @@ class MeshIssueExaminerServer:
         # Clear cache
         self._tools['mesh_clear_cache'] = MCPTool(
             name='mesh_clear_cache',
-            description='Clear mesh and result cache',
+            description=(
+                'Free cached mesh data and inspection results. '
+                'Call to release memory or force a fresh reload.'
+            ),
             input_schema={
                 'type': 'object',
                 'properties': {
                     'mesh_id': {
                         'type': 'string',
-                        'description': 'Optional specific mesh ID to clear'
-                    }
-                }
-            }
-        )
-
-        # List operations
-        self._tools['list_operations'] = MCPTool(
-            name='list_operations',
-            description='List all available inspection operations',
-            input_schema={
-                'type': 'object',
-                'properties': {
-                    'category': {
-                        'type': 'string',
-                        'enum': ['topological', 'geometric', 'quality', 'orientation'],
-                        'description': 'Filter by category'
-                    },
-                    'library': {
-                        'type': 'string',
-                        'description': 'Filter by supported library'
+                        'description': (
+                            'Specific mesh to clear. If omitted, clears all '
+                            'cached meshes and results.'
+                        )
                     }
                 }
             }
@@ -254,14 +328,14 @@ class MeshIssueExaminerServer:
             elif method == 'mesh_inspect':
                 result = await self._handle_inspect(request.params)
 
-            elif method == 'mesh_get_result':
-                result = self._handle_get_result(request.params)
+            elif method == 'mesh_get_issues':
+                result = self._handle_get_issues(request.params)
+
+            elif method == 'mesh_get_quality_metrics':
+                result = self._handle_get_quality_metrics(request.params)
 
             elif method == 'mesh_clear_cache':
                 result = self._handle_clear_cache(request.params)
-
-            elif method == 'list_operations':
-                result = self._handle_list_operations(request.params)
 
             else:
                 result = None
@@ -318,52 +392,115 @@ class MeshIssueExaminerServer:
     async def _handle_inspect(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Handle mesh inspection request."""
         mesh_id = params['mesh_id']
-        operations = params.get('operations', ['all'])
         categories = params.get('categories')
+        operations = params.get('operations')
+
+        if categories is not None and operations is not None:
+            raise ValueError(
+                "Provide 'categories' or 'operations', not both."
+            )
 
         mesh = self._mesh_cache.get(mesh_id)
         if mesh is None:
             raise ValueError(f"Mesh not found: {mesh_id}")
 
         # Determine which operations to run
-        if operations == ['all'] or operations == 'all':
-            op_ids = None  # Will use all registered
-        else:
-            # Validate operation IDs
-            available_ops = {op.operation_id for op in registry.list_all()}
-            invalid_ops = [op for op in operations if op not in available_ops]
-            if invalid_ops:
-                raise ValueError(f"Unknown operation(s): {', '.join(invalid_ops)}. "
-                               f"Use 'list_operations' to see available operations.")
-            op_ids = operations
-
-        # Create and execute workflow
-        start_time = time.perf_counter()
-
-        if op_ids is None:
-            # Run all operations
-            workflow = registry.create_full_workflow(config=self.config)
-        else:
+        if operations is not None:
+            # Validate operation IDs against registry
+            available = {op.operation_id for op in registry.list_all()}
+            invalid = [o for o in operations if o not in available]
+            if invalid:
+                raise ValueError(
+                    f"Unknown operation(s): {', '.join(invalid)}. "
+                    f"Discover IDs via the mesh://operations resource."
+                )
+            workflow = registry.create_workflow(operations, config=self.config)
+        elif categories is not None:
+            # Build workflow from categories
+            op_ids = []
+            for c in categories:
+                cat = IssueCategory(c)
+                op_ids.extend(
+                    op.operation_id
+                    for op in registry.list_by_category(cat)
+                )
             workflow = registry.create_workflow(op_ids, config=self.config)
+        else:
+            # Default: run all operations
+            workflow = registry.create_full_workflow(config=self.config)
 
+        start_time = time.perf_counter()
         result = workflow(mesh)
         result.processing_time = time.perf_counter() - start_time
 
         # Cache result
         self._result_cache[mesh_id] = result
 
-        return result.to_dict()
+        # Return summary only
+        return {
+            "mesh_id": mesh_id,
+            "passed": result.passed,
+            "processing_time": result.processing_time,
+            "summary": result.summary,
+        }
 
-    def _handle_get_result(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle get cached result request."""
+    def _handle_get_issues(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Retrieve detected issues with filtering and pagination."""
         mesh_id = params['mesh_id']
-        include_details = params.get('include_details', False)
-
         result = self._result_cache.get(mesh_id)
         if result is None:
-            raise ValueError(f"Result not found for mesh: {mesh_id}")
+            raise ValueError(
+                f"No inspection result for mesh: {mesh_id}. "
+                f"Run mesh_inspect first."
+            )
 
-        return result.to_dict()
+        issues = result.issues
+
+        # Filter by severity
+        if 'severity' in params:
+            sev = IssueSeverity(params['severity'])
+            issues = [i for i in issues if i.severity == sev]
+
+        # Filter by category
+        if 'category' in params:
+            cat = IssueCategory(params['category'])
+            issues = [i for i in issues if i.category == cat]
+
+        # Pagination
+        total = len(issues)
+        limit = max(1, min(params.get('limit', 50), 200))
+        offset = max(0, params.get('offset', 0))
+        page = issues[offset : offset + limit]
+
+        return {
+            'total_count': total,
+            'returned_count': len(page),
+            'offset': offset,
+            'issues': [i.to_dict() for i in page],
+        }
+
+    def _handle_get_quality_metrics(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Retrieve quality metrics from a completed inspection."""
+        mesh_id = params['mesh_id']
+        result = self._result_cache.get(mesh_id)
+        if result is None:
+            raise ValueError(
+                f"No inspection result for mesh: {mesh_id}. "
+                f"Run mesh_inspect first."
+            )
+
+        metrics = result.quality_metrics
+
+        # Optional filter by metric name
+        if 'metric_name' in params:
+            metric_name = params['metric_name']
+            metrics = [m for m in metrics if m.metric_name == metric_name]
+
+        return {
+            'mesh_id': mesh_id,
+            'metric_count': len(metrics),
+            'metrics': [m.to_dict() for m in metrics],
+        }
 
     def _handle_clear_cache(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Handle clear cache request."""
@@ -385,27 +522,305 @@ class MeshIssueExaminerServer:
 
         return {'status': 'cleared', 'cleared_ids': cleared}
 
-    def _handle_list_operations(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Handle list operations request."""
-        category = params.get('category')
-        library = params.get('library')
-
-        if category:
-            cat_enum = IssueCategory(category)
-            operations = registry.list_by_category(cat_enum)
-        elif library:
-            operations = registry.list_by_library(library)
-        else:
-            operations = registry.list_all()
-
-        return [op.to_dict() for op in operations]
-
     def __repr__(self) -> str:
         return f"<MeshIssueExaminerServer: {len(self._tools)} tools, {len(self._mesh_cache)} cached meshes>"
 
 
+# ---------------------------------------------------------------------------
+# FastMCP protocol layer (standard MCP SDK)
+# ---------------------------------------------------------------------------
+
+
+def create_mcp_server(
+    config: Optional[OperationConfig] = None,
+    auto_register_operations: bool = True,
+) -> "FastMCP":
+    """Create a standards-compliant MCP server using the official SDK.
+
+    Returns a :class:`mcp.server.fastmcp.FastMCP` instance with all mesh
+    examination tools registered via the canonical ``@mcp.tool()`` decorator
+    pattern.  Use ``mcp.run()`` to start serving over stdio (default) or
+    streamable-http.
+
+    Args:
+        config: Optional operation configuration forwarded to the
+            business-logic layer.
+        auto_register_operations: Whether to auto-register built-in
+            inspection operations.
+
+    Example::
+
+        mcp = create_mcp_server()
+        mcp.run()                       # stdio transport (default)
+        mcp.run(transport="streamable-http")  # HTTP transport
+    """
+    from mcp.server.fastmcp import FastMCP
+
+    backend = MeshIssueExaminerServer(
+        config=config,
+        auto_register_operations=auto_register_operations,
+    )
+
+    mcp = FastMCP("mesh-issue-examiner")
+
+    # -- mesh_load --------------------------------------------------------
+
+    @mcp.tool()
+    async def mesh_load(
+        file_path: str,
+        mesh_id: str | None = None,
+        library: str | None = None,
+    ) -> str:
+        """Load a mesh file for subsequent inspection operations.
+
+        Use this tool when you need to import a mesh from a local file
+        (STL, OBJ, PLY, VTK, NAS, and other formats supported by meshio).
+
+        Args:
+            file_path: Absolute or relative path to the mesh file.
+            mesh_id: Optional custom identifier.  If omitted the server
+                generates one from the filename.
+            library: Preferred loading library.  One of "trimesh",
+                "pyvista", "pymeshlab".  If omitted the server picks
+                automatically.
+
+        Returns:
+            JSON string with mesh_id, vertex/face counts, bounding box,
+            and source format.
+
+        Example:
+            Load "model.stl" and then inspect it::
+
+                result = mesh_load(file_path="model.stl")
+                mesh_inspect(mesh_id=<mesh_id from result>)
+        """
+        params: Dict[str, Any] = {"file_path": file_path}
+        if mesh_id is not None:
+            params["mesh_id"] = mesh_id
+        if library is not None:
+            params["library"] = library
+        result = await backend._handle_load(params)
+        return json.dumps(result, indent=2)
+
+    # -- mesh_inspect -----------------------------------------------------
+
+    @mcp.tool()
+    async def mesh_inspect(
+        mesh_id: str,
+        categories: list[str] | None = None,
+        operations: list[str] | None = None,
+    ) -> str:
+        """Execute inspection operations on a previously loaded mesh.
+
+        Provide ONE of ``categories`` or ``operations`` to run a subset;
+        omit both to run every registered operation.
+
+        Args:
+            mesh_id: Identifier returned by mesh_load.
+            categories: Run all operations in these categories.
+                Each value must be one of: "topological", "geometric",
+                "quality", "orientation".
+            operations: Run these specific operation IDs.
+                Discover IDs via the mesh://operations resource.
+
+        Returns:
+            JSON summary with severity counts, pass/fail flag, category
+            breakdown, and processing time.  DOES NOT include individual
+            issues or quality metrics -- use mesh_get_issues and
+            mesh_get_quality_metrics to drill down.
+
+        Errors:
+            ValueError -- mesh_id not found in cache.
+            ValueError -- unknown operation ID.
+            ValueError -- both categories and operations provided
+                (mutual exclusion).
+
+        Example::
+
+            # Run everything
+            mesh_inspect(mesh_id="bracket")
+
+            # Run just topological checks
+            mesh_inspect(mesh_id="bracket", categories=["topological"])
+
+            # Run one specific operation
+            mesh_inspect(mesh_id="bracket",
+                         operations=["topology.detect_nonmanifold_edges"])
+        """
+        params: Dict[str, Any] = {"mesh_id": mesh_id}
+        if categories is not None:
+            params["categories"] = categories
+        if operations is not None:
+            params["operations"] = operations
+        result = await backend._handle_inspect(params)
+        return json.dumps(result, indent=2)
+
+    # -- mesh_get_issues --------------------------------------------------
+
+    @mcp.tool()
+    def mesh_get_issues(
+        mesh_id: str,
+        severity: str | None = None,
+        category: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> str:
+        """Retrieve detected issues from a completed inspection.
+
+        Call after mesh_inspect.  Supports filtering and pagination to
+        control response size.
+
+        Args:
+            mesh_id: Identifier from mesh_load.
+            severity: Filter -- "critical" | "error" | "warning" | "info".
+                Returns all severities when omitted.
+            category: Filter -- "topological" | "geometric" | "quality"
+                | "orientation".  Returns all categories when omitted.
+            limit: Max issues to return (1-200, default 50).
+            offset: Skip this many issues for pagination.
+
+        Returns:
+            JSON with total_count (matching filter), returned_count,
+            offset, and the issue list.
+
+        Errors:
+            ValueError -- mesh_id not found or no inspection run yet.
+
+        Example::
+
+            # First page of critical issues
+            mesh_get_issues(mesh_id="bracket", severity="critical")
+
+            # Paginated geometric issues
+            mesh_get_issues(mesh_id="bracket", category="geometric",
+                            limit=20, offset=0)
+        """
+        params: Dict[str, Any] = {"mesh_id": mesh_id, "limit": limit, "offset": offset}
+        if severity is not None:
+            params["severity"] = severity
+        if category is not None:
+            params["category"] = category
+        result = backend._handle_get_issues(params)
+        return json.dumps(result, indent=2)
+
+    # -- mesh_get_quality_metrics -----------------------------------------
+
+    @mcp.tool()
+    def mesh_get_quality_metrics(
+        mesh_id: str,
+        metric_name: str | None = None,
+    ) -> str:
+        """Retrieve quality metrics from a completed inspection.
+
+        Call after mesh_inspect.  Returns per-metric statistics (min,
+        max, mean, median, std, p5, p95) and violation counts.
+
+        Args:
+            mesh_id: Identifier from mesh_load.
+            metric_name: Specific metric to retrieve (e.g. "aspect_ratio",
+                "scaled_jacobian").  Returns all metrics when omitted.
+
+        Returns:
+            JSON with metric_count and array of metric objects.  Each
+            contains metric_name, statistics, threshold, violation_count,
+            and total_count.
+
+        Errors:
+            ValueError -- mesh_id not found or no inspection run yet.
+
+        Example::
+
+            mesh_get_quality_metrics(mesh_id="bracket")
+            mesh_get_quality_metrics(mesh_id="bracket",
+                                     metric_name="aspect_ratio")
+        """
+        params: Dict[str, Any] = {"mesh_id": mesh_id}
+        if metric_name is not None:
+            params["metric_name"] = metric_name
+        result = backend._handle_get_quality_metrics(params)
+        return json.dumps(result, indent=2)
+
+    # -- mesh_clear_cache -------------------------------------------------
+
+    @mcp.tool()
+    def mesh_clear_cache(mesh_id: str | None = None) -> str:
+        """Free cached mesh data and inspection results.
+
+        Call to release memory or force a fresh reload.
+
+        Args:
+            mesh_id: Specific mesh to clear.  If omitted, clears all
+                cached meshes and results.
+
+        Returns:
+            JSON string with status and list of cleared IDs.
+
+        Example:
+            Clear everything:  mesh_clear_cache()
+            Clear one mesh:    mesh_clear_cache(mesh_id="my_mesh")
+        """
+        params: Dict[str, Any] = {}
+        if mesh_id is not None:
+            params["mesh_id"] = mesh_id
+        result = backend._handle_clear_cache(params)
+        return json.dumps(result, indent=2)
+
+    # -- Resources --------------------------------------------------------
+
+    @mcp.resource("mesh://operations")
+    def operations_catalog() -> str:
+        """Catalog of all available inspection operations.
+
+        Returns JSON array of operation descriptors including operation_id,
+        display_name, description, category, supported_libraries,
+        recommended_library, complexity, and tags.
+        """
+        operations = registry.list_all()
+        return json.dumps([op.to_dict() for op in operations], indent=2)
+
+    @mcp.resource("mesh://{mesh_id}/info")
+    def mesh_info(mesh_id: str) -> str:
+        """Mesh metadata: vertex/face counts, bounding box, format,
+        volume cell types.
+
+        Available after mesh_load.
+        """
+        mesh = backend._mesh_cache.get(mesh_id)
+        if mesh is None:
+            return json.dumps({
+                "error": f"Mesh not found: {mesh_id}",
+                "hint": "Load a mesh first using mesh_load.",
+            })
+        return json.dumps(mesh.to_dict(), indent=2)
+
+    @mcp.resource("mesh://{mesh_id}/summary")
+    def inspection_summary(mesh_id: str) -> str:
+        """Inspection summary: severity counts, pass/fail flag,
+        category breakdown, processing time.
+
+        Available after mesh_inspect.
+        """
+        result = backend._result_cache.get(mesh_id)
+        if result is None:
+            return json.dumps({
+                "error": f"No inspection result for mesh: {mesh_id}",
+                "hint": "Run mesh_inspect first.",
+            })
+        return json.dumps({
+            "mesh_id": mesh_id,
+            "passed": result.passed,
+            "processing_time": result.processing_time,
+            "summary": result.summary,
+        }, indent=2)
+
+    return mcp
+
+
 def main():
-    """Entry point for the mesh-examiner console command."""
-    server = MeshIssueExaminerServer()
-    print(f"Mesh Issue Examiner Server initialized: {server}")
-    return server
+    """Entry point for the mesh-examiner console command.
+
+    Starts a standards-compliant MCP server over stdio transport using
+    the official MCP Python SDK (FastMCP).
+    """
+    mcp = create_mcp_server()
+    mcp.run()
