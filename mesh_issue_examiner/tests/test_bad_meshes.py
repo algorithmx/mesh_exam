@@ -11,6 +11,7 @@ import numpy as np
 
 from mesh_issue_examiner.core.models import MeshInput, MeshIssue, IssueCategory, IssueSeverity
 from mesh_issue_examiner.operations.topological.nonmanifold_edges import NonManifoldEdgeDetection
+from mesh_issue_examiner.operations.topological.nonmanifold_vertices import NonManifoldVertexDetection
 from mesh_issue_examiner.operations.quality.cell_quality import CellQualityComputation
 from mesh_issue_examiner.operations.operation_registry import OperationRegistry
 
@@ -23,6 +24,7 @@ def _make_registry():
     """Create a fresh OperationRegistry with standard operations registered."""
     reg = OperationRegistry()
     reg.register(NonManifoldEdgeDetection())
+    reg.register(NonManifoldVertexDetection())
     reg.register(CellQualityComputation())
     return reg
 
@@ -172,6 +174,84 @@ class TestNonManifoldVertex:
         # is non-manifold.  The edge-based detector won't flag it.
         # That is expected behaviour; we just ensure it runs cleanly.
         assert isinstance(issues, list)
+
+    def test_detects_nonmanifold_vertex(self):
+        """The vertex-based detector should flag vertex 0."""
+        mesh = self._make_touching_tetrahedra()
+        op = NonManifoldVertexDetection()
+        issues = op.execute(mesh)
+        assert len(issues) >= 1
+        assert any('non-manifold' in i.message.lower() or 'nonmanifold' in i.message.lower()
+                    for i in issues)
+
+    def test_vertex_zero_has_two_components(self):
+        """Vertex 0 should have 2 connected components (one per tetrahedron)."""
+        mesh = self._make_touching_tetrahedra()
+        op = NonManifoldVertexDetection()
+        issues = op.execute(mesh)
+        assert len(issues) >= 1
+        v0_loc = next(
+            (loc for loc in issues[0].locations if loc.element_index == 0), None
+        )
+        assert v0_loc is not None, "Vertex 0 should be in issue locations"
+        assert v0_loc.adjacent_elements['connected_components'] == 2
+
+    def test_issue_category_is_topological(self):
+        """Non-manifold vertex issues must be TOPOLOGICAL category."""
+        mesh = self._make_touching_tetrahedra()
+        op = NonManifoldVertexDetection()
+        issues = op.execute(mesh)
+        assert len(issues) >= 1
+        assert issues[0].category == IssueCategory.TOPOLOGICAL
+
+    def test_issue_metrics_contain_count(self):
+        """Metrics dict should include a 'count' key >= 1."""
+        mesh = self._make_touching_tetrahedra()
+        op = NonManifoldVertexDetection()
+        issues = op.execute(mesh)
+        assert 'count' in issues[0].metrics
+        assert issues[0].metrics['count'] >= 1
+
+    def test_clean_tetrahedron_no_nonmanifold_vertices(self):
+        """A single watertight tetrahedron has no non-manifold vertices."""
+        vertices = np.array([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        faces = np.array([
+            [0, 1, 2],
+            [0, 3, 1],
+            [1, 3, 2],
+            [2, 3, 0],
+        ])
+        mesh = MeshInput(vertices, faces)
+        op = NonManifoldVertexDetection()
+        issues = op.execute(mesh)
+        assert issues == []
+
+    def test_manifold_fan_not_detected(self):
+        """A single closed fan (star) of triangles around v0 is manifold."""
+        vertices = np.array([
+            [0.0, 0.0, 0.0],  # center
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+        ])
+        faces = np.array([
+            [0, 1, 2],
+            [0, 2, 3],
+            [0, 3, 4],
+            [0, 4, 5],
+            [0, 5, 1],
+        ])
+        mesh = MeshInput(vertices, faces)
+        op = NonManifoldVertexDetection()
+        issues = op.execute(mesh)
+        assert issues == []
 
     def test_mesh_is_valid_for_quality(self):
         """Quality computation should run on the mesh without error."""
@@ -678,7 +758,7 @@ class TestRegistryListing:
     def test_len_matches_registered_count(self):
         """len(registry) should equal the number of registered operations."""
         reg = _make_registry()
-        assert len(reg) == 2
+        assert len(reg) == 3
 
     def test_unregister(self):
         """Unregistering an operation should remove it from the registry."""
@@ -686,7 +766,7 @@ class TestRegistryListing:
         assert 'topology.detect_nonmanifold_edges' in reg
         reg.unregister('topology.detect_nonmanifold_edges')
         assert 'topology.detect_nonmanifold_edges' not in reg
-        assert len(reg) == 1
+        assert len(reg) == 2
 
     def test_register_duplicate_is_idempotent(self):
         """Registering the same operation twice is idempotent (no error)."""

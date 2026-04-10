@@ -14,11 +14,13 @@ Two layers are provided:
 """
 
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 
+from ..core.exceptions import MeshExaminerError
 from ..core.models import (
     MeshInput,
     InspectionResult,
@@ -28,6 +30,8 @@ from ..core.models import (
 )
 from ..operations.operation_registry import registry
 from ..utils.mesh_loader import load_mesh_from_file
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -153,11 +157,13 @@ class MeshIssueExaminerServer:
                 'properties': {
                     'file_path': {
                         'type': 'string',
-                        'description': 'Absolute path to the mesh file on the server filesystem.'
+                        'description': 'Absolute path to the mesh file on the server filesystem.',
+                        'minLength': 1
                     },
                     'mesh_id': {
                         'type': 'string',
-                        'description': 'Custom identifier. Defaults to filename stem.'
+                        'description': 'Custom identifier. Defaults to filename stem.',
+                        'minLength': 1
                     },
                     'library': {
                         'type': 'string',
@@ -184,7 +190,8 @@ class MeshIssueExaminerServer:
                 'properties': {
                     'mesh_id': {
                         'type': 'string',
-                        'description': 'Identifier returned by mesh_load.'
+                        'description': 'Identifier returned by mesh_load.',
+                        'minLength': 1
                     },
                     'categories': {
                         'type': 'array',
@@ -204,7 +211,8 @@ class MeshIssueExaminerServer:
                             'Run these specific operation IDs. '
                             'Discover IDs via the mesh://operations resource. '
                             'Mutually exclusive with categories.'
-                        )
+                        ),
+                        'minItems': 1
                     }
                 },
                 'required': ['mesh_id']
@@ -224,7 +232,8 @@ class MeshIssueExaminerServer:
                 'properties': {
                     'mesh_id': {
                         'type': 'string',
-                        'description': 'Identifier from mesh_load.'
+                        'description': 'Identifier from mesh_load.',
+                        'minLength': 1
                     },
                     'severity': {
                         'type': 'string',
@@ -267,7 +276,8 @@ class MeshIssueExaminerServer:
                 'properties': {
                     'mesh_id': {
                         'type': 'string',
-                        'description': 'Identifier from mesh_load.'
+                        'description': 'Identifier from mesh_load.',
+                        'minLength': 1
                     },
                     'metric_name': {
                         'type': 'string',
@@ -347,13 +357,37 @@ class MeshIssueExaminerServer:
                 request_id=request.request_id
             )
 
+        except (ValueError, FileNotFoundError) as e:
+            # Business-logic errors — safe to expose to caller
+            return MCPResponse(
+                result=None,
+                error={
+                    'code': 'business_error',
+                    'message': str(e),
+                    'type': type(e).__name__
+                },
+                request_id=request.request_id
+            )
+        except MeshExaminerError as e:
+            # Domain errors (UnsupportedFormatError, MeshLoadError, OperationError, etc.)
+            return MCPResponse(
+                result=None,
+                error={
+                    'code': 'business_error',
+                    'message': str(e),
+                    'type': type(e).__name__
+                },
+                request_id=request.request_id
+            )
         except Exception as e:
+            # System errors — do NOT expose internals
+            logger.error("Unhandled error in %s: %s", request.method, e, exc_info=True)
             return MCPResponse(
                 result=None,
                 error={
                     'code': 'internal_error',
-                    'message': str(e),
-                    'type': type(e).__name__
+                    'message': 'Internal server error',
+                    'type': 'internal_error'
                 },
                 request_id=request.request_id
             )

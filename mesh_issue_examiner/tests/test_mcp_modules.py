@@ -468,3 +468,240 @@ class TestGetToolDefinitions:
             defs = get_tool_definitions()
         for td in defs:
             assert isinstance(td, ToolDefinition)
+
+
+# ---------------------------------------------------------------------------
+# Part 4: JSON Schema constraint tests (P1 — section 3.2.2)
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaConstraints:
+    """Verify JSON Schema has minLength / minItems constraints."""
+
+    @staticmethod
+    def _prop(tool_name: str, prop_name: str) -> dict:
+        server = _make_server()
+        schema = server._tools[tool_name].input_schema
+        return schema["properties"][prop_name]
+
+    def test_mesh_load_file_path_has_min_length(self):
+        assert self._prop("mesh_load", "file_path")["minLength"] == 1
+
+    def test_mesh_load_mesh_id_has_min_length(self):
+        assert self._prop("mesh_load", "mesh_id")["minLength"] == 1
+
+    def test_mesh_inspect_mesh_id_has_min_length(self):
+        assert self._prop("mesh_inspect", "mesh_id")["minLength"] == 1
+
+    def test_mesh_inspect_operations_has_min_items(self):
+        assert self._prop("mesh_inspect", "operations")["minItems"] == 1
+
+    def test_mesh_get_issues_mesh_id_has_min_length(self):
+        assert self._prop("mesh_get_issues", "mesh_id")["minLength"] == 1
+
+    def test_mesh_get_quality_metrics_mesh_id_has_min_length(self):
+        assert self._prop("mesh_get_quality_metrics", "mesh_id")["minLength"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Part 5: Error handling hygiene tests (P1 — section 3.2.5)
+# ---------------------------------------------------------------------------
+
+
+class TestErrorHandlingHygiene:
+    """Verify three-tier error handling: business vs domain vs system."""
+
+    def test_value_error_returns_business_error_code(self):
+        server = _make_server()
+        req = MCPRequest(method="mesh_inspect", params={"mesh_id": "no_such"})
+        resp = asyncio.run(server.handle_request(req))
+        assert resp.error is not None
+        assert resp.error["code"] == "business_error"
+        assert resp.error["type"] == "ValueError"
+
+    def test_file_not_found_returns_business_error_code(self):
+        server = _make_server()
+        req = MCPRequest(
+            method="mesh_load", params={"file_path": "/nonexistent/path/test.stl"}
+        )
+        resp = asyncio.run(server.handle_request(req))
+        assert resp.error is not None
+        assert resp.error["code"] == "business_error"
+        assert resp.error["type"] == "FileNotFoundError"
+
+    def test_system_error_returns_generic_message(self):
+        """System errors must NOT expose the real exception text."""
+        server = _make_server()
+
+        def crashing_handler(params):
+            raise RuntimeError("secret internal detail")
+
+        server._handle_clear_cache = crashing_handler
+        req = MCPRequest(method="mesh_clear_cache", params={})
+        resp = asyncio.run(server.handle_request(req))
+        assert resp.error is not None
+        assert resp.error["code"] == "internal_error"
+        assert "secret internal detail" not in resp.error["message"]
+        assert resp.error["message"] == "Internal server error"
+
+    def test_system_error_does_not_expose_exception_type(self):
+        server = _make_server()
+
+        def crashing_handler(params):
+            raise RuntimeError("boom")
+
+        server._handle_clear_cache = crashing_handler
+        req = MCPRequest(method="mesh_clear_cache", params={})
+        resp = asyncio.run(server.handle_request(req))
+        assert resp.error["type"] == "internal_error"
+        assert resp.error["type"] != "RuntimeError"
+
+
+# ---------------------------------------------------------------------------
+# Part 6: File type validation test (P1 — section 3.2.4)
+# ---------------------------------------------------------------------------
+
+
+class TestFileTypeValidation:
+    """Verify unsupported file formats are rejected via domain error."""
+
+    def test_unsupported_format_returns_business_error(self):
+        """Loading a .xyz file should surface UnsupportedFormatError as business_error."""
+        import tempfile, os
+        server = _make_server()
+        # Create a temp file with unsupported extension
+        with tempfile.NamedTemporaryFile(suffix=".xyz", delete=False) as f:
+            f.write(b"dummy")
+            tmp_path = f.name
+        try:
+            req = MCPRequest(
+                method="mesh_load", params={"file_path": tmp_path}
+            )
+            resp = asyncio.run(server.handle_request(req))
+            assert resp.error is not None
+            assert resp.error["code"] == "business_error"
+            assert "UnsupportedFormatError" in resp.error["type"]
+        finally:
+            os.unlink(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Part 7: _handle_get_issues filtering & pagination tests
+# ---------------------------------------------------------------------------
+
+
+def _server_with_issues(n_issues=10):
+    """Create a server with a mocked inspection result containing n_issues."""
+    from unittest.mock import MagicMock
+    from mesh_issue_examiner.core.models import (
+        MeshIssue, IssueSeverity, IssueCategory,
+    )
+
+    server = _make_server()
+    severities = [IssueSeverity.ERROR, IssueSeverity.WARNING, IssueSeverity.INFO]
+    categories = [IssueCategory.TOPOLOGICAL, IssueCategory.GEOMETRIC]
+    issues = [
+        MeshIssue(
+            operation_id="test.op",
+            category=categories[i % len(categories)],
+            severity=severities[i % len(severities)],
+            message=f"Issue {i}",
+            locations=[],
+        )
+        for i in range(n_issues)
+    ]
+    mock_result = MagicMock()
+    mock_result.issues = issues
+    mock_result.quality_metrics = []
+    server._result_cache["test_mesh"] = mock_result
+    return server
+
+
+class TestHandleGetIssues:
+    """Tests for _handle_get_issues filtering and pagination."""
+
+    def test_default_pagination(self):
+        server = _server_with_issues(10)
+        result = server._handle_get_issues({"mesh_id": "test_mesh"})
+        assert result["total_count"] == 10
+        assert result["returned_count"] == 10
+        assert result["offset"] == 0
+
+    def test_with_limit(self):
+        server = _server_with_issues(10)
+        result = server._handle_get_issues({"mesh_id": "test_mesh", "limit": 3})
+        assert result["total_count"] == 10
+        assert result["returned_count"] == 3
+
+    def test_with_offset(self):
+        server = _server_with_issues(10)
+        result = server._handle_get_issues({"mesh_id": "test_mesh", "offset": 8})
+        assert result["returned_count"] == 2
+        assert result["offset"] == 8
+
+    def test_filter_by_severity(self):
+        server = _server_with_issues(10)
+        result = server._handle_get_issues(
+            {"mesh_id": "test_mesh", "severity": "error"}
+        )
+        # 10 issues, cycling ERROR/WARNING/INFO → 4 ERRORs (indices 0,3,6,9)
+        assert result["total_count"] == 4
+        for issue in result["issues"]:
+            assert issue["severity"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# Part 8: _handle_get_quality_metrics filtering tests
+# ---------------------------------------------------------------------------
+
+
+def _server_with_metrics():
+    """Create a server with mocked quality metrics."""
+    from unittest.mock import MagicMock
+    from mesh_issue_examiner.core.models import QualityMetrics
+
+    server = _make_server()
+    metrics = [
+        QualityMetrics(
+            operation_id="test.op",
+            metric_name="aspect_ratio",
+            values=[1.0, 2.0, 3.0],
+            threshold=0.1,
+        ),
+        QualityMetrics(
+            operation_id="test.op",
+            metric_name="scaled_jacobian",
+            values=[0.5, 0.8, 0.9],
+            threshold=0.3,
+        ),
+    ]
+    mock_result = MagicMock()
+    mock_result.quality_metrics = metrics
+    mock_result.issues = []
+    server._result_cache["test_mesh"] = mock_result
+    return server
+
+
+class TestHandleGetQualityMetrics:
+    """Tests for _handle_get_quality_metrics filtering."""
+
+    def test_get_all_metrics(self):
+        server = _server_with_metrics()
+        result = server._handle_get_quality_metrics({"mesh_id": "test_mesh"})
+        assert result["metric_count"] == 2
+
+    def test_filter_by_metric_name(self):
+        server = _server_with_metrics()
+        result = server._handle_get_quality_metrics(
+            {"mesh_id": "test_mesh", "metric_name": "aspect_ratio"}
+        )
+        assert result["metric_count"] == 1
+        assert result["metrics"][0]["metric_name"] == "aspect_ratio"
+
+    def test_unknown_metric_name_returns_empty(self):
+        server = _server_with_metrics()
+        result = server._handle_get_quality_metrics(
+            {"mesh_id": "test_mesh", "metric_name": "nonexistent"}
+        )
+        assert result["metric_count"] == 0
+        assert result["metrics"] == []

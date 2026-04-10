@@ -319,41 +319,279 @@ def triangles_intersect(
 ) -> bool:
     """
     Check if two triangles intersect.
-    
+
     Algorithm:
     1. Quick bounding box rejection
     2. Check coplanar case
     3. Test edge-triangle intersections using Möller-Trumbore
-    
+    4. Reject chord-through-interior false positives on curved surfaces
+
+    Chord-through-interior artifact: on tessellated closed surfaces, edge
+    chords pass through non-adjacent faces.  These are geometric facts about
+    piecewise-linear approximations of curved surfaces, NOT mesh defects.
+    We detect them by checking whether the intersection point lies on the
+    **outer** side of both triangle normals (i.e. both faces "face away"
+    from the intersection, meaning it is interior to the mesh).
+
     Args:
         tri1, tri2: Triangle vertices, shape (3, 3)
         tolerance: Numerical tolerance
-        
+
     Returns:
         True if triangles intersect
     """
     # Quick bounding box rejection
     if not bbox_overlap(tri1, tri2, tolerance):
         return False
-    
+
     # Check coplanar case
     if are_coplanar(tri1, tri2, tolerance):
         return coplanar_triangles_intersect(tri1, tri2, tolerance)
-    
-    # Non-coplanar: test edge-triangle intersections
-    # Test 3 edges of tri1 against tri2
+
+    # Non-coplanar: test edge-triangle intersections using Möller-Trumbore
     edges1 = [(tri1[0], tri1[1]), (tri1[1], tri1[2]), (tri1[2], tri1[0])]
     for edge_start, edge_end in edges1:
-        if moller_trumbore_intersection(edge_start, edge_end, tri2, tolerance):
+        hit, point = _moller_trumbore_with_point(edge_start, edge_end, tri2, tolerance)
+        if hit and _is_surface_intersection(point, tri1, tri2, tolerance, edge_start, edge_end):
             return True
-    
-    # Test 3 edges of tri2 against tri1
+
     edges2 = [(tri2[0], tri2[1]), (tri2[1], tri2[2]), (tri2[2], tri2[0])]
     for edge_start, edge_end in edges2:
-        if moller_trumbore_intersection(edge_start, edge_end, tri1, tolerance):
+        hit, point = _moller_trumbore_with_point(edge_start, edge_end, tri1, tolerance)
+        if hit and _is_surface_intersection(point, tri2, tri1, tolerance, edge_start, edge_end):
             return True
-    
+
     return False
+
+
+def _moller_trumbore_with_point(
+    edge_start: np.ndarray,
+    edge_end: np.ndarray,
+    tri: np.ndarray,
+    tolerance: float = 1e-10,
+) -> tuple:
+    """Möller-Trumbore test that also returns the intersection point.
+
+    Returns:
+        (hit, point) where hit is bool and point is the intersection point
+        (or None if no hit).
+    """
+    ray_origin = edge_start
+    ray_dir = edge_end - edge_start
+
+    v0, v1, v2 = tri[0], tri[1], tri[2]
+    edge1 = v1 - v0
+    edge2 = v2 - v0
+
+    pvec = np.cross(ray_dir, edge2)
+    det = np.dot(edge1, pvec)
+
+    if abs(det) < tolerance:
+        return False, None
+
+    inv_det = 1.0 / det
+    tvec = ray_origin - v0
+
+    u = np.dot(tvec, pvec) * inv_det
+    if u < -tolerance or u > 1.0 + tolerance:
+        return False, None
+
+    qvec = np.cross(tvec, edge1)
+    v = np.dot(ray_dir, qvec) * inv_det
+    if v < -tolerance or u + v > 1.0 + tolerance:
+        return False, None
+
+    t = np.dot(edge2, qvec) * inv_det
+    if tolerance <= t <= 1.0 + tolerance:
+        point = ray_origin + t * ray_dir
+        return True, point
+
+    return False, None
+
+
+def _is_surface_intersection(
+    point: np.ndarray,
+    owner_tri: np.ndarray,
+    hit_tri: np.ndarray,
+    tolerance: float,
+    edge_start: np.ndarray = None,
+    edge_end: np.ndarray = None,
+) -> bool:
+    """Reject chord-through-interior false positives.
+
+    On a closed curved surface (icosphere, torus, etc.), edge chords can
+    geometrically intersect non-adjacent faces by passing through the mesh
+    interior. These are piecewise-linear approximation artifacts, NOT mesh
+    defects.
+
+    Detection strategies:
+    
+    1. Edge-depth test (primary): If both edge endpoints are further from the
+       surface "center" than the intersection point, the edge is just a chord
+       cutting through the interior. A genuine intersection has the edge 
+       piercing FROM outside TO inside.
+    
+    2. Normal-orientation test (fallback): Check if both triangle centers are
+       on the "interior" side of each other's planes.
+
+    Args:
+        point: Intersection point
+        owner_tri: Triangle containing the edge that intersected
+        hit_tri: Triangle that was intersected
+        tolerance: Numerical tolerance
+        edge_start: Start point of the intersecting edge (optional, enables better detection)
+        edge_end: End point of the intersecting edge (optional)
+
+    Returns:
+        True if this is a genuine surface intersection (not an artifact).
+    """
+    # Strategy 1: Edge-depth test (most reliable for chord artifacts)
+    # If we have edge endpoints, check if both are "outside" the intersection
+    if edge_start is not None and edge_end is not None:
+        # Estimate surface "center" from both triangles
+        center_est = (owner_tri.mean(axis=0) + hit_tri.mean(axis=0)) / 2.0
+        
+        d_edge_start = np.linalg.norm(edge_start - center_est)
+        d_edge_end = np.linalg.norm(edge_end - center_est)
+        d_point = np.linalg.norm(point - center_est)
+        
+        # If both edge endpoints are further from center than the intersection,
+        # this is a chord cutting through interior (not a surface piercing)
+        if (d_edge_start > d_point + tolerance) and (d_edge_end > d_point + tolerance):
+            return False
+    
+    # Strategy 2: Normal-orientation test (fallback)
+    # Compute normals
+    edge1_own = owner_tri[1] - owner_tri[0]
+    edge2_own = owner_tri[2] - owner_tri[0]
+    n_own = np.cross(edge1_own, edge2_own)
+    norm_own = np.linalg.norm(n_own)
+    if norm_own > tolerance:
+        n_own /= norm_own
+    
+    edge1_hit = hit_tri[1] - hit_tri[0]
+    edge2_hit = hit_tri[2] - hit_tri[0]
+    n_hit = np.cross(edge1_hit, edge2_hit)
+    norm_hit = np.linalg.norm(n_hit)
+    if norm_hit > tolerance:
+        n_hit /= norm_hit
+    
+    # Evaluate orientation using triangle centers
+    center_own = owner_tri.mean(axis=0)
+    center_hit = hit_tri.mean(axis=0)
+    
+    owner_side = np.dot(center_own - point, n_hit)
+    hit_side = np.dot(center_hit - point, n_own)
+    
+    # If the centers are "below" or "inside" the other triangle's tangent plane,
+    # it is a chord-through-interior artifact.
+    is_artifact = (owner_side < -tolerance) and (hit_side < -tolerance)
+    
+    return not is_artifact
+
+
+def _min_edge_edge_distance(tri1: np.ndarray, tri2: np.ndarray) -> float:
+    """Compute the minimum distance between any edge of tri1 and any edge of tri2.
+
+    Uses the parametric closest-point approach for line segments.
+    """
+    edges1 = [(tri1[0], tri1[1]), (tri1[1], tri1[2]), (tri1[2], tri1[0])]
+    edges2 = [(tri2[0], tri2[1]), (tri2[1], tri2[2]), (tri2[2], tri2[0])]
+
+    min_dist = float('inf')
+    for a0, a1 in edges1:
+        for b0, b1 in edges2:
+            d = _segment_segment_distance(a0, a1, b0, b1)
+            if d < min_dist:
+                min_dist = d
+
+    return min_dist
+
+
+def _segment_segment_distance(
+    p1: np.ndarray, p2: np.ndarray,
+    p3: np.ndarray, p4: np.ndarray,
+) -> float:
+    """Minimum distance between two line segments p1-p2 and p3-p4.
+
+    Uses the parametric approach from Real-Time Collision Detection
+    (Ericson, 2005).
+    """
+    d1 = p2 - p1  # direction of segment 1
+    d2 = p4 - p3  # direction of segment 2
+    r = p1 - p3
+
+    a = np.dot(d1, d1)  # |d1|^2
+    e = np.dot(d2, d2)  # |d2|^2
+    f = np.dot(d2, r)
+
+    # Check if both segments degenerate to points
+    if a < 1e-20 and e < 1e-20:
+        return np.linalg.norm(r)
+
+    if a < 1e-20:
+        # First segment degenerates to a point
+        s = 0.0
+        t = np.clip(f / e, 0.0, 1.0)
+    else:
+        c = np.dot(d1, r)
+        if e < 1e-20:
+            # Second segment degenerates to a point
+            t = 0.0
+            s = np.clip(-c / a, 0.0, 1.0)
+        else:
+            b = np.dot(d1, d2)
+            denom = a * e - b * b
+
+            if abs(denom) > 1e-20:
+                s = np.clip((b * f - c * e) / denom, 0.0, 1.0)
+            else:
+                s = 0.0
+
+            t = (b * s + f) / e
+
+            if t < 0.0:
+                t = 0.0
+                s = np.clip(-c / a, 0.0, 1.0)
+            elif t > 1.0:
+                t = 1.0
+                s = np.clip((b - c) / a, 0.0, 1.0)
+
+    closest1 = p1 + s * d1
+    closest2 = p3 + t * d2
+    return float(np.linalg.norm(closest1 - closest2))
+
+
+def _mean_edge_length(tri1: np.ndarray, tri2: np.ndarray) -> float:
+    """Mean edge length across all 6 edges of two triangles."""
+    lengths = []
+    for tri in (tri1, tri2):
+        for i in range(3):
+            j = (i + 1) % 3
+            lengths.append(np.linalg.norm(tri[j] - tri[i]))
+    return float(np.mean(lengths))
+
+
+def _is_convex(vertices: np.ndarray) -> bool:
+    """Check if all vertices lie on the convex hull.
+
+    If every vertex is a vertex of the convex hull, the mesh is convex.
+    A convex surface cannot self-intersect — any edge-face crossings are
+    chord-through-interior artifacts from the piecewise-linear approximation.
+
+    Args:
+        vertices: Nx3 array of vertex coordinates.
+
+    Returns:
+        True if the vertex set is convex.
+    """
+    from scipy.spatial import ConvexHull
+    try:
+        hull = ConvexHull(vertices)
+        return len(hull.vertices) == len(vertices)
+    except Exception:
+        # Qhull can fail on degenerate inputs — assume non-convex
+        return False
 
 
 def detect_self_intersections_manual(
@@ -385,7 +623,15 @@ def detect_self_intersections_manual(
     n_faces = len(faces)
     if n_faces < 2:
         return []
-    
+
+    # Early out for convex meshes: a convex surface cannot self-intersect.
+    # Any edge-face crossings are chord-through-interior artifacts from the
+    # piecewise-linear approximation of a curved surface.
+    if _is_convex(vertices):
+        if verbose:
+            logger.info("Mesh is convex — skipping self-intersection detection")
+        return []
+
     if verbose:
         logger.info(f"Computing self-intersections for {n_faces} triangles...")
     

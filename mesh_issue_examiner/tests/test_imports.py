@@ -130,6 +130,8 @@ class TestModuleLevelSideEffects:
 
         assert "topology.detect_nonmanifold_edges" in registry
 
+        assert "topology.detect_nonmanifold_vertices" in registry
+
     def test_mcp_server_import_does_not_raise(self):
         """Importing the MCP server must not trigger uncaught exceptions.
 
