@@ -199,25 +199,21 @@ class TrimeshAdapter(MeshAdapter):
         return mesh.face_normals
 
     def detect_self_intersections(self, mesh: 'trimesh.Trimesh') -> List[Tuple[int, int]]:
-        """Detect self-intersections."""
-        # Watertight meshes cannot self-intersect
-        if mesh.is_watertight:
-            return []
-
-        # Use TRimesh's intersection detection
-        # Note: This may require additional processing
-        intersections = []
-
-        # Simple check using convex hull comparison
-        if hasattr(mesh, 'volume') and hasattr(mesh, 'convex_hull'):
-            hull = mesh.convex_hull
-            # If volumes are significantly different, there may be self-intersections
-            if mesh.volume > 0 and hull.volume > 0:
-                volume_ratio = mesh.volume / hull.volume
-                if volume_ratio < 0.9:  # Threshold for potential intersections
-                    intersections.append(('volume_mismatch', 0))
-
-        return intersections
+        """Detect self-intersections.
+        
+        .. note::
+            TRimesh does not provide reliable self-intersection detection that
+            returns specific face pairs. This method returns an empty list.
+            Use PyVistaAdapter for proper self-intersection detection.
+        
+        Returns:
+            Empty list. TRimesh does not support face-pair intersection detection.
+        """
+        logger.warning(
+            "TRimesh does not provide self-intersection detection. "
+            "Use PyVistaAdapter for this functionality."
+        )
+        return []
 
     def compute_cell_quality(
         self,

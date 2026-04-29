@@ -19,8 +19,12 @@ from mesh_issue_examiner.mcp.server import MeshIssueExaminerServer, MCPRequest
 SAMPLE_DIR = Path(__file__).resolve().parents[2] / "e2e" / "sample_meshes"
 
 
-def _mesh_file(subdir: str, fmt: str = "stl") -> str:
+def _mesh_file(subdir: str, fmt: str = "stl", file_override: str = None) -> str:
     """Absolute path to a sample mesh file."""
+    if file_override:
+        p = SAMPLE_DIR / subdir / file_override
+        if p.exists():
+            return str(p)
     for ext in (fmt, "stl", "obj"):
         p = SAMPLE_DIR / subdir / f"{subdir}.{ext}"
         if p.exists():
@@ -32,9 +36,9 @@ def _server():
     return MeshIssueExaminerServer(auto_register_operations=True)
 
 
-async def _load_inspect_get_issues(server, subdir, fmt="stl"):
+async def _load_inspect_get_issues(server, subdir, fmt="stl", file_override=None):
     """Full pipeline: load -> inspect -> get_issues. Returns three dicts."""
-    req = MCPRequest(method="mesh_load", params={"file_path": _mesh_file(subdir, fmt)})
+    req = MCPRequest(method="mesh_load", params={"file_path": _mesh_file(subdir, fmt, file_override)})
     resp = await server.handle_request(req)
     assert resp.error is None, f"load failed for {subdir}: {resp.error}"
     load = resp.result
@@ -58,13 +62,9 @@ async def _load_inspect_get_issues(server, subdir, fmt="stl"):
 # ===================================================================
 
 PERFECT_MESHES = [
-    "perfect_triangle",
-    "perfect_tetrahedron",
-    "perfect_square",
     "perfect_cube_surface",
     "perfect_hexahedron",
     "torus",
-    "cylinder",
     "pyramid",
     "wedge",
 ]
@@ -177,10 +177,16 @@ DEFECTIVE_CASES = {
     "isolated_vertices": {
         "expect_passed": False,
         "expect_keywords": ["isolated"],
+        "format": "vtk",
+        "file_override": "isolated_vertices_surface.vtk",
     },
     "duplicate_vertices": {
         "expect_passed": False,
         "expect_keywords": ["duplicate", "faces"],
+    },
+    "perfect_tetrahedron": {
+        "expect_passed": False,
+        "expect_keywords": ["orientation", "inconsistent"],
     },
 }
 
@@ -192,8 +198,11 @@ class TestDefectiveMeshes:
     @pytest.mark.parametrize("mesh_name", list(DEFECTIVE_CASES))
     async def test_fails_inspection(self, mesh_name):
         server = _server()
-        _, inspect, _ = await _load_inspect_get_issues(server, mesh_name)
-        expected = DEFECTIVE_CASES[mesh_name]["expect_passed"]
+        case = DEFECTIVE_CASES[mesh_name]
+        fmt = case.get("format", "stl")
+        fov = case.get("file_override")
+        _, inspect, _ = await _load_inspect_get_issues(server, mesh_name, fmt, fov)
+        expected = case["expect_passed"]
         assert inspect["passed"] == expected, (
             f"{mesh_name}: expected passed={expected}, "
             f"got {inspect['passed']}, "
@@ -204,7 +213,10 @@ class TestDefectiveMeshes:
     @pytest.mark.parametrize("mesh_name", list(DEFECTIVE_CASES))
     async def test_has_issues(self, mesh_name):
         server = _server()
-        _, inspect, _ = await _load_inspect_get_issues(server, mesh_name)
+        case = DEFECTIVE_CASES[mesh_name]
+        fmt = case.get("format", "stl")
+        fov = case.get("file_override")
+        _, inspect, _ = await _load_inspect_get_issues(server, mesh_name, fmt, fov)
         assert inspect["summary"]["total_issues"] > 0
 
     @pytest.mark.asyncio
@@ -216,7 +228,9 @@ class TestDefectiveMeshes:
             pytest.skip(f"{mesh_name}: no specific keywords to check")
 
         server = _server()
-        _, _, issues = await _load_inspect_get_issues(server, mesh_name)
+        fmt = case.get("format", "stl")
+        fov = case.get("file_override")
+        _, _, issues = await _load_inspect_get_issues(server, mesh_name, fmt, fov)
         op_ids = {i["operation_id"] for i in issues["issues"]}
 
         for kw in case["expect_keywords"]:
@@ -234,12 +248,14 @@ OPEN_MESHES = [
     "holey_plane",
     "multi_hole_plane",
     "subdivided_plane",
+    "cylinder",
+    "perfect_triangle",
+    "perfect_square",
 ]
 
 CLOSED_MESHES = [
     "perfect_cube_surface",
     "torus",
-    "perfect_tetrahedron",
     "shell_structure",  # Thin-walled cube, actually watertight
 ]
 

@@ -182,34 +182,61 @@ def point_in_triangle_2d(p: np.ndarray, tri: np.ndarray) -> bool:
     return (a >= -1e-10) and (b >= -1e-10) and (c >= -1e-10)
 
 
-def edges_intersect_2d(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray, p4: np.ndarray) -> bool:
+def edges_intersect_2d(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray, p4: np.ndarray,
+                        tolerance: float = 1e-15) -> bool:
     """
     Check if two line segments intersect in 2D.
+    
+    Handles all intersection cases including:
+    - Normal crossing segments
+    - Segments touching at endpoints
+    - Collinear overlapping segments
+    
+    Uses orientation-based algorithm from computational geometry literature:
+    - de Berg et al., "Computational Geometry: Algorithms and Applications"
+    - Standard approach used in CGAL, LEDA, and other CG libraries
     
     Args:
         p1, p2: First segment endpoints
         p3, p4: Second segment endpoints
+        tolerance: Numerical tolerance for collinearity checks
         
     Returns:
-        True if segments intersect (including at endpoints)
+        True if segments intersect (including at endpoints or overlapping)
     """
     def cross_2d(a, b):
         return a[0] * b[1] - a[1] * b[0]
     
-    r = p2 - p1
-    s = p4 - p3
+    def on_segment(a, b, c):
+        """Check if point b lies on segment ac (assuming collinear)."""
+        return (
+            min(a[0], c[0]) - tolerance <= b[0] <= max(a[0], c[0]) + tolerance and
+            min(a[1], c[1]) - tolerance <= b[1] <= max(a[1], c[1]) + tolerance
+        )
     
-    denom = cross_2d(r, s)
+    # Compute orientation values (2D cross products)
+    o1 = cross_2d(p2 - p1, p3 - p1)
+    o2 = cross_2d(p2 - p1, p4 - p1)
+    o3 = cross_2d(p4 - p3, p1 - p3)
+    o4 = cross_2d(p4 - p3, p2 - p3)
     
-    if abs(denom) < 1e-15:
-        # Lines are parallel
-        return False
+    # General case: proper intersection (segments cross each other)
+    cond1 = (o1 > tolerance and o2 < -tolerance) or (o1 < -tolerance and o2 > tolerance)
+    cond2 = (o3 > tolerance and o4 < -tolerance) or (o3 < -tolerance and o4 > tolerance)
+    if cond1 and cond2:
+        return True
     
-    diff = p3 - p1
-    t = cross_2d(diff, s) / denom
-    u = cross_2d(diff, r) / denom
+    # Special Cases: collinear points
+    if abs(o1) < tolerance and on_segment(p1, p3, p2):
+        return True
+    if abs(o2) < tolerance and on_segment(p1, p4, p2):
+        return True
+    if abs(o3) < tolerance and on_segment(p3, p1, p4):
+        return True
+    if abs(o4) < tolerance and on_segment(p3, p2, p4):
+        return True
     
-    return (0 <= t <= 1) and (0 <= u <= 1)
+    return False
 
 
 def coplanar_triangles_intersect(tri1: np.ndarray, tri2: np.ndarray, tolerance: float = 1e-10) -> bool:

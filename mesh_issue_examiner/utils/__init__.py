@@ -19,6 +19,16 @@ from .cell_types import (
     validate_volume_cells,
 )
 
+# Topology utilities (Gap #13)
+from .topology import (
+    compute_vertex_valence,
+    build_vertex_faces_map,
+    build_edge_face_map,
+    extract_unique_edges,
+    compute_edge_lengths,
+    compute_face_areas,
+)
+
 __all__ = [
     "load_mesh_from_file",
     "create_mesh_from_arrays",
@@ -34,4 +44,11 @@ __all__ = [
     "get_vtk_type_to_name",
     "detect_element_type",
     "validate_volume_cells",
+    # Topology utilities
+    "compute_vertex_valence",
+    "build_vertex_faces_map",
+    "build_edge_face_map",
+    "extract_unique_edges",
+    "compute_edge_lengths",
+    "compute_face_areas",
 ]

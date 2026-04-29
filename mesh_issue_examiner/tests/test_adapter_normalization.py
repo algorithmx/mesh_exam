@@ -80,6 +80,7 @@ class TestAdapterCapabilityMatrix:
             AdapterCapability.FILE_IO |
             AdapterCapability.QUALITY_METRICS |
             AdapterCapability.TOPOLOGY_CHECKS |
+            AdapterCapability.SELF_INTERSECTION |
             AdapterCapability.REMESHING
         ),
         'meshio': (

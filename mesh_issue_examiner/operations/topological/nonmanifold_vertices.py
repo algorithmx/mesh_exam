@@ -186,37 +186,22 @@ class NonManifoldVertexDetection(BaseOperation):
             )
 
             # Build face-face adjacency: two faces are connected if they share
-            # another vertex (besides vi).
+            # an edge through vertex vi (i.e., they have 2 vertices in common:
+            # vi and one other vertex).
             n_inc = len(incident_face_indices)
-            # Build adjacency using a vertex-to-face-local-index map
-            other_verts_flat = other_verts.ravel()  # (2*n_inc,) with -1 placeholders
-            local_face_ids = np.repeat(np.arange(n_inc), 3)
 
-            # Only consider valid other vertices (not -1)
-            valid_mask = other_verts_flat != -1
-            valid_other = other_verts_flat[valid_mask]
-            valid_local = local_face_ids[valid_mask]
-
-            # Group by other-vertex: faces sharing the same other-vertex
-            # are connected through vi.
-            # Use BFS to count connected components.
+            # Build adjacency: faces share an edge iff they have 2 vertices in common
             adj: Dict[int, Set[int]] = defaultdict(set)
-            sort2 = np.argsort(valid_other, kind='mergesort')
-            sorted_other = valid_other[sort2]
-            sorted_local = valid_local[sort2]
-
-            # Find groups of identical other-vertex values
-            if len(sorted_other) > 0:
-                change_points = np.where(
-                    np.diff(sorted_other) != 0
-                )[0] + 1
-                groups = np.split(sorted_local, change_points)
-                for group in groups:
-                    group_list = group.tolist()
-                    for i_local in group_list:
-                        for j_local in group_list:
-                            if i_local != j_local:
-                                adj[i_local].add(j_local)
+            for i in range(n_inc):
+                for j in range(i + 1, n_inc):
+                    # Get vertices of each face (excluding vi)
+                    verts_i = set(incident_faces[i]) - {vi}
+                    verts_j = set(incident_faces[j]) - {vi}
+                    # Faces share an edge if they share exactly one other vertex
+                    # (plus vi = 2 vertices total in common)
+                    if len(verts_i & verts_j) == 1:
+                        adj[i].add(j)
+                        adj[j].add(i)
 
             # BFS to count connected components
             visited = [False] * n_inc

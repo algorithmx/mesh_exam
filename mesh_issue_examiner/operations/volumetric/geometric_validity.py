@@ -258,7 +258,6 @@ class GeometricValidityAssessment(BaseOperation):
 
         sliver_mask = (
             (~tet_degenerate) &
-            (np.abs(tet_volumes) > self.degenerate_tolerance) &
             (sliver_ratio < self.sliver_threshold)
         )
 

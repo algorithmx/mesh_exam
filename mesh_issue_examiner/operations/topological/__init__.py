@@ -12,6 +12,11 @@ from .disconnected_components import DisconnectedComponentDetection
 from .isolated_vertices import IsolatedVertexDetection
 from .duplicate_faces import DuplicateFaceDetection
 
+# Granular reporting operations (Gap #13)
+from .vertex_valence import VertexValenceDetection
+from .edge_dihedral import EdgeDihedralAngleDetection
+from .edge_length_ratio import EdgeLengthRatioDetection
+
 __all__ = [
     "NonManifoldEdgeDetection",
     "NonManifoldVertexDetection",
@@ -22,4 +27,8 @@ __all__ = [
     "DisconnectedComponentDetection",
     "IsolatedVertexDetection",
     "DuplicateFaceDetection",
+    # Granular reporting operations
+    "VertexValenceDetection",
+    "EdgeDihedralAngleDetection",
+    "EdgeLengthRatioDetection",
 ]

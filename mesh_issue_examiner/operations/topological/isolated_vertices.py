@@ -59,7 +59,7 @@ class IsolatedVertexDetection(BaseOperation):
         if n_verts == 0:
             return []
 
-        if n_faces := len(faces) == 0:
+        if (n_faces := len(faces)) == 0:
             # All vertices are isolated when there are no faces
             isolated = set(range(n_verts))
         else:

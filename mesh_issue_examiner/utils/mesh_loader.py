@@ -125,6 +125,7 @@ def load_mesh_from_file(
     library: Optional[str] = None,
     extract_volume_cells: bool = True,
     allowed_dirs: Optional[List[Union[str, Path]]] = None,
+    material_array_name: Optional[str] = None,
     **kwargs
 ) -> MeshInput:
     """
@@ -139,6 +140,10 @@ def load_mesh_from_file(
                 (requires meshio for best support)
         allowed_dirs: Optional list of directories that mesh files may be loaded from.
                 If provided, file_path must resolve to a location under one of these dirs.
+        material_array_name: Optional name of cell data array containing material IDs.
+                When provided, the loader will attempt to extract material assignments
+                from the mesh file's cell data. Supported for formats like VTK, Exodus,
+                Gmsh, etc. that store per-cell data.
         **kwargs: Additional library-specific arguments
 
     Returns:
@@ -183,7 +188,7 @@ def load_mesh_from_file(
 
         _validate_mesh_arrays(vertices, faces)
         mesh_id = mesh_id or file_path.stem
-        return MeshInput(
+        mesh_input = MeshInput(
             vertices=vertices,
             faces=faces,
             mesh_id=mesh_id,
@@ -191,6 +196,17 @@ def load_mesh_from_file(
             file_path=str(file_path),
             volume_cells=volume_cells if volume_cells else None,
         )
+
+        # Extract materials from NASTRAN if requested
+        if material_array_name:
+            from .material_reader import extract_materials_from_nas
+            cell_mats, mat_names = extract_materials_from_nas(str(file_path), material_array_name)
+            if cell_mats is not None:
+                mesh_input.cell_materials = cell_mats
+                if mat_names:
+                    mesh_input.material_names = mat_names
+
+        return mesh_input
 
     # Determine library to use
     available_libraries = FORMAT_SUPPORT[suffix]
@@ -237,6 +253,11 @@ def load_mesh_from_file(
             )
             mesh_input.file_path = str(file_path)
             mesh_input.source_format = suffix[1:]
+
+            # Extract material assignments if requested
+            if material_array_name:
+                _extract_material_data(mesh_input, native_mesh, material_array_name)
+
             return mesh_input
 
         # Surface-only fast path (skip volume cells)
@@ -351,3 +372,41 @@ def _is_library_available(library: str) -> bool:
         return True
     except ImportError:
         return False
+
+
+def _extract_material_data(
+    mesh_input: MeshInput,
+    native_mesh: Any,
+    array_name: str,
+) -> None:
+    """Extract material assignments from a native mesh object's cell data.
+
+    Tries PyVista cell_data first, then falls back to meshio-style
+    cell_data dicts.
+
+    Args:
+        mesh_input: The MeshInput to attach materials to.
+        native_mesh: The library-specific mesh object.
+        array_name: Name of the cell data array containing material IDs.
+    """
+    cell_materials = None
+
+    # Try PyVista-style cell_data access
+    if hasattr(native_mesh, 'cell_data'):
+        cd = native_mesh.cell_data
+        if isinstance(cd, dict) and array_name in cd:
+            cell_materials = np.asarray(cd[array_name]).flatten()
+        elif hasattr(cd, 'get') and cd.get(array_name) is not None:
+            cell_materials = np.asarray(cd.get(array_name)).flatten()
+
+    # Try meshio-style cell_data (dict of dicts)
+    if cell_materials is None and hasattr(native_mesh, 'cell_data_dict'):
+        cdd = native_mesh.cell_data_dict
+        if array_name in cdd:
+            # meshio returns per-block arrays; concatenate
+            arrays = list(cdd[array_name].values())
+            if arrays:
+                cell_materials = np.concatenate([np.asarray(a).flatten() for a in arrays])
+
+    if cell_materials is not None and len(cell_materials) > 0:
+        mesh_input.cell_materials = cell_materials

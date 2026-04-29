@@ -4,9 +4,20 @@ Volume cell quality computation operation for volumetric (3D) meshes.
 Computes quality metrics for 3D elements (tetrahedra, hexahedra,
 prisms, pyramids) such as Jacobian ratio, scaled Jacobian,
 volume-length ratio, and condition number.
+
+Extended Quality Metrics (added 2026-04):
+    - warpage: deviation of quadrilateral faces from planarity
+    - equiangle_skew: angular deviation from ideal (CFD standard)
+    - stretch: ratio of min edge to max diagonal
+    - taper: ratio of opposite face areas (hex)
+    - radius_ratio: circumradius / inradius (tets)
+    - collapse_ratio: minimum altitude / max edge
+    - min_dihedral_angle: minimum angle between adjacent faces
+    - max_dihedral_angle: maximum angle between adjacent faces
 """
 
-from typing import List, Dict, Optional
+import logging
+from typing import List, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -20,6 +31,65 @@ from ...core.models import (
 )
 from ..base import BaseOperation, OperationMetadata
 from ..operation_registry import registry
+
+logger = logging.getLogger(__name__)
+
+
+# Extended quality types with new metrics
+EXTENDED_QUALITY_TYPES = [
+    # Existing metrics
+    'scaled_jacobian', 'volume', 'aspect_ratio', 'condition', 'shape',
+    'skewness', 'skew', 'orthogonality',
+    # New metrics - Phase 1
+    'warpage', 'equiangle_skew', 'stretch',
+    # New metrics - Phase 2
+    'taper', 'radius_ratio', 'collapse_ratio',
+    # New metrics - Phase 3 (computed, not via VTK)
+    # 'min_dihedral_angle', 'max_dihedral_angle',
+]
+
+# Element-specific metric applicability
+# Maps metric name to list of element types that support it
+METRIC_ELEMENT_SUPPORT: Dict[str, List[str]] = {
+    # All element types
+    'scaled_jacobian': ['tet4', 'hex8', 'prism6', 'pyramid5'],
+    'volume': ['tet4', 'hex8', 'prism6', 'pyramid5'],
+    'aspect_ratio': ['tet4', 'hex8', 'prism6', 'pyramid5'],
+    'condition': ['tet4', 'hex8', 'prism6', 'pyramid5'],
+    'shape': ['tet4', 'hex8', 'prism6', 'pyramid5'],
+    'skewness': ['tet4', 'hex8', 'prism6', 'pyramid5'],
+    'skew': ['tet4', 'hex8', 'prism6', 'pyramid5'],
+    'stretch': ['tet4', 'hex8', 'prism6', 'pyramid5'],
+    'collapse_ratio': ['tet4', 'hex8', 'prism6', 'pyramid5'],
+    'equiangle_skew': ['tet4', 'hex8', 'prism6', 'pyramid5'],
+    'radius_ratio': ['tet4'],  # Primary for tets
+    # Hex elements with quad faces
+    'warpage': ['hex8', 'prism6', 'pyramid5'],
+    'taper': ['hex8'],
+    'orthogonality': ['hex8', 'prism6'],
+}
+
+# Industry-standard thresholds for quality metrics
+# Based on research from ANSYS, SimScale, FEA Academy
+DEFAULT_THRESHOLDS = {
+    # Existing metrics
+    'scaled_jacobian': 0.1,
+    'volume': 1e-12,
+    'aspect_ratio': 0.1,
+    'condition': 100.0,
+    'shape': 0.3,
+    'skewness': 0.8,
+    'skew': 0.8,
+    'orthogonality': 0.15,
+    # New metrics - Phase 1
+    'warpage': 0.5,           # < 0.5 good, > 0.7 poor (ANSYS)
+    'equiangle_skew': 0.25,   # CFD: avg < 0.25, max < 0.9
+    'stretch': 0.25,          # > 0.25 acceptable
+    # New metrics - Phase 2
+    'taper': 0.5,             # < 0.5 good
+    'radius_ratio': 10.0,     # < 10 good, > 10 poor (tets)
+    'collapse_ratio': 0.1,    # Context dependent
+}
 
 
 class VolumeCellQualityComputation(BaseOperation):
@@ -37,33 +107,42 @@ class VolumeCellQualityComputation(BaseOperation):
         - skewness: deviation from ideal cell shape
         - skew: same as skewness (alias)
         - orthogonality: face normal orthogonality (hex/prism)
+        
+    Extended metrics (new):
+        - warpage: deviation of quadrilateral faces from planarity (hex/prism/pyramid)
+        - equiangle_skew: angular deviation from ideal (CFD standard)
+        - stretch: ratio of minimum edge to maximum diagonal
+        - taper: ratio of opposite face areas (hexahedra)
+        - radius_ratio: ratio of circumradius to inradius (tetrahedra)
+        - collapse_ratio: minimum altitude divided by maximum edge
+
+    Element-specific applicability:
+        - warpage: hex8, prism6, pyramid5 (elements with quad faces)
+        - taper: hex8 (elements with opposite faces)
+        - radius_ratio: tet4 (primary), extensible to others
+        - Other metrics: all element types
     """
 
     def __init__(
         self,
         config: Optional[OperationConfig] = None,
-        quality_types: Optional[List[str]] = None
+        quality_types: Optional[List[str]] = None,
+        skip_unsupported_metrics: bool = True,
     ):
         super().__init__(config)
         self.quality_types = quality_types or [
             'scaled_jacobian', 'volume', 'aspect_ratio',
             'condition', 'shape',
         ]
+        self.skip_unsupported_metrics = skip_unsupported_metrics
 
         # Default thresholds for 3D elements
-        self.thresholds = {
-            'scaled_jacobian': 0.1,
-            'volume': 1e-12,
-            'aspect_ratio': 0.1,
-            'condition': 100.0,
-            'shape': 0.3,
-            'skewness': 0.8,
-            'skew': 0.8,
-            'orthogonality': 0.15,
-        }
+        self.thresholds = DEFAULT_THRESHOLDS.copy()
 
-        # Metrics where higher values are worse (violation if value > threshold)
-        self._higher_is_worse = {'condition'}
+    # Metrics where higher values are worse (violation if value > threshold)
+    _higher_is_worse = {
+        'condition', 'warpage', 'equiangle_skew', 'taper', 'radius_ratio'
+    }
 
     @property
     def metadata(self) -> OperationMetadata:
@@ -72,13 +151,14 @@ class VolumeCellQualityComputation(BaseOperation):
             display_name='Volume Cell Quality Computation (3D)',
             description='Computes quality metrics for volumetric cells '
                        '(tet/hex/prism/pyramid) including scaled Jacobian, '
-                       'volume, and aspect ratio.',
+                       'volume, aspect ratio, warpage, equiangle skew, and more.',
             category=IssueCategory.QUALITY,
             supported_libraries=['pyvista'],
             recommended_library='pyvista',
             requires_adjacency=False,
             complexity='O(n)',
-            tags=['quality', 'shape', 'volumetric', '3d', 'jacobian', 'volume']
+            tags=['quality', 'shape', 'volumetric', '3d', 'jacobian', 'volume',
+                  'warpage', 'skew', 'taper', 'stretch']
         )
 
     def execute(self, mesh: MeshInput) -> List[MeshIssue]:
@@ -88,6 +168,9 @@ class VolumeCellQualityComputation(BaseOperation):
         Otherwise converts to a PyVista UnstructuredGrid and computes
         each configured quality metric, reporting cells that fall below
         the corresponding threshold.
+        
+        Metrics that are not applicable to the mesh's element types
+        are skipped with a warning (if skip_unsupported_metrics=True).
         """
         if not mesh.has_volume_cells:
             return []
@@ -97,15 +180,24 @@ class VolumeCellQualityComputation(BaseOperation):
         grid = mesh.get_native('pyvista')
 
         issues: List[MeshIssue] = []
+        
+        # Get mesh element types
+        mesh_element_types = list(mesh.volume_cells.keys())
 
         for quality_type in self.quality_types:
-            try:
-                values = adapter.compute_cell_quality(grid, quality_type)
-            except Exception:
-                # Skip metrics that this VTK version cannot compute
-                continue
-
-            if len(values) == 0:
+            # Check if metric is applicable to this mesh
+            if self.skip_unsupported_metrics:
+                if not self._is_metric_applicable(quality_type, mesh_element_types):
+                    logger.debug(
+                        f"Skipping metric '{quality_type}' - not applicable to "
+                        f"mesh element types: {mesh_element_types}"
+                    )
+                    continue
+            
+            # Compute metric with error handling
+            values = self._compute_metric_safe(adapter, grid, quality_type)
+            
+            if values is None:
                 continue
 
             threshold = self.thresholds.get(quality_type)
@@ -145,7 +237,7 @@ class VolumeCellQualityComputation(BaseOperation):
                 severity=severity,
                 message=(
                     f'{quality_type}: {violations}/{total} cells '
-                    f'({violation_rate * 100:.1f}%) below threshold {threshold}'
+                    f'({violation_rate * 100:.1f}%) violate threshold {threshold}'
                 ),
                 metrics={
                     'violation_count': violations,
@@ -167,6 +259,60 @@ class VolumeCellQualityComputation(BaseOperation):
             issues.append(issue)
 
         return issues
+
+    def _is_metric_applicable(
+        self, 
+        metric: str, 
+        mesh_element_types: List[str]
+    ) -> bool:
+        """Check if a quality metric is applicable to mesh element types.
+        
+        Args:
+            metric: Quality metric name
+            mesh_element_types: List of element types in the mesh
+            
+        Returns:
+            True if metric applies to any mesh element type
+        """
+        supported_elements = METRIC_ELEMENT_SUPPORT.get(metric, [])
+        
+        # Metric applies if any mesh element type is in supported list
+        return any(elem in supported_elements for elem in mesh_element_types)
+
+    def _compute_metric_safe(
+        self, 
+        adapter, 
+        grid, 
+        quality_type: str
+    ) -> Optional[np.ndarray]:
+        """Compute a quality metric with graceful error handling.
+        
+        Args:
+            adapter: Mesh adapter instance
+            grid: PyVista grid object
+            quality_type: Quality metric name
+            
+        Returns:
+            Array of quality values, or None if computation failed
+        """
+        try:
+            values = adapter.compute_cell_quality(grid, quality_type)
+            
+            if len(values) == 0:
+                return None
+                
+            # VTK returns -1 for undefined metrics
+            if np.all(values == -1.0):
+                logger.debug(
+                    f"Metric '{quality_type}' returned all -1 (unsupported for this mesh)"
+                )
+                return None
+                
+            return values
+            
+        except Exception as e:
+            logger.debug(f"Failed to compute metric '{quality_type}': {e}")
+            return None
 
     def _determine_severity(self, violation_rate: float) -> IssueSeverity:
         """Determine severity based on violation rate."""

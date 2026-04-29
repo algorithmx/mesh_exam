@@ -287,7 +287,9 @@ class MeshInput:
         mesh_id: str = "",
         source_format: str = "",
         file_path: Optional[str] = None,
-        volume_cells: Optional[Dict[str, Union[np.ndarray, List[List[int]]]]] = None
+        volume_cells: Optional[Dict[str, Union[np.ndarray, List[List[int]]]]] = None,
+        cell_materials: Optional[Union[np.ndarray, List[int]]] = None,
+        material_names: Optional[Dict[int, str]] = None,
     ):
         self.mesh_id = mesh_id or f"mesh_{id(self)}"
         self.file_path = file_path
@@ -307,6 +309,12 @@ class MeshInput:
             for etype, arr in volume_cells.items():
                 converted = np.array(arr) if not isinstance(arr, np.ndarray) else arr
                 self._volume_cells[etype] = converted
+
+        # Material support for multi-material meshes
+        self._cell_materials: Optional[np.ndarray] = None
+        if cell_materials is not None:
+            self._cell_materials = np.array(cell_materials) if not isinstance(cell_materials, np.ndarray) else cell_materials
+        self._material_names: Optional[Dict[int, str]] = material_names
 
     @property
     def vertices(self) -> np.ndarray:
@@ -378,6 +386,73 @@ class MeshInput:
         return list(self._volume_cells.keys())
 
     @property
+    def cell_materials(self) -> Optional[np.ndarray]:
+        """Get material ID for each cell. Shape: (n_cells,)."""
+        return self._cell_materials.copy() if self._cell_materials is not None else None
+
+    @cell_materials.setter
+    def cell_materials(self, value: Optional[Union[np.ndarray, List[int]]]):
+        """Set material assignments and invalidate cache."""
+        if value is None:
+            self._cell_materials = None
+        else:
+            self._cell_materials = np.array(value) if not isinstance(value, np.ndarray) else value
+        self.invalidate_cache()
+
+    @property
+    def material_names(self) -> Optional[Dict[int, str]]:
+        """Get material ID to name mapping."""
+        return self._material_names
+
+    @material_names.setter
+    def material_names(self, value: Optional[Dict[int, str]]):
+        """Set material name mapping."""
+        self._material_names = value
+
+    def has_multiple_materials(self) -> bool:
+        """Check if mesh has multiple materials assigned."""
+        if self._cell_materials is None:
+            return False
+        return len(np.unique(self._cell_materials)) > 1
+
+    def get_cells_by_material(self, material_id: int) -> np.ndarray:
+        """Get indices of cells with the given material ID."""
+        if self._cell_materials is None:
+            return np.array([], dtype=int)
+        return np.where(self._cell_materials == material_id)[0]
+
+    def get_material_for_cell(self, cell_idx: int) -> Optional[int]:
+        """Get material ID for a specific cell."""
+        if self._cell_materials is None:
+            return None
+        return int(self._cell_materials[cell_idx])
+
+    def validate_materials(self) -> List[str]:
+        """Validate material assignments. Returns list of warning messages."""
+        warnings = []
+        if self._cell_materials is None:
+            return warnings
+
+        total_cells = self.n_volume_cells
+        if total_cells > 0 and len(self._cell_materials) != total_cells:
+            warnings.append(
+                f"cell_materials length ({len(self._cell_materials)}) "
+                f"doesn't match total cells ({total_cells})"
+            )
+
+        if self._material_names:
+            used_ids = set(np.unique(self._cell_materials).tolist())
+            defined_ids = set(self._material_names.keys())
+            orphaned = used_ids - defined_ids
+            if orphaned:
+                warnings.append(f"Undefined material IDs: {orphaned}")
+            unused = defined_ids - used_ids
+            if unused:
+                warnings.append(f"Unused material definitions: {unused}")
+
+        return warnings
+
+    @property
     def bounding_box(self) -> Tuple[np.ndarray, np.ndarray]:
         """Return (min_coords, max_coords) bounding box."""
         return np.min(self._vertices, axis=0), np.max(self._vertices, axis=0)
@@ -433,13 +508,17 @@ class MeshInput:
     def copy(self) -> 'MeshInput':
         """Create a deep copy of this mesh."""
         vc_copy = {k: v.copy() for k, v in self._volume_cells.items()} if self._volume_cells else None
+        cm_copy = self._cell_materials.copy() if self._cell_materials is not None else None
+        mn_copy = dict(self._material_names) if self._material_names else None
         return MeshInput(
             vertices=self._vertices.copy(),
             faces=self._faces.copy(),
             mesh_id=f"{self.mesh_id}_copy",
             source_format=self.source_format,
             file_path=self.file_path,
-            volume_cells=vc_copy
+            volume_cells=vc_copy,
+            cell_materials=cm_copy,
+            material_names=mn_copy,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -458,4 +537,11 @@ class MeshInput:
         if self.has_volume_cells:
             result['n_volume_cells'] = self.n_volume_cells
             result['cell_types'] = self.cell_types
+        if self._cell_materials is not None:
+            unique_materials = np.unique(self._cell_materials).tolist()
+            result['materials'] = {
+                'count': len(unique_materials),
+                'ids': unique_materials,
+                'names': self._material_names or {},
+            }
         return result

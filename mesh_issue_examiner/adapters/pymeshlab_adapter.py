@@ -64,7 +64,8 @@ class PyMeshLabAdapter(MeshAdapter):
             AdapterCapability.FILE_IO |
             AdapterCapability.QUALITY_METRICS |
             AdapterCapability.TOPOLOGY_CHECKS |
-            AdapterCapability.REMESHING
+            AdapterCapability.REMESHING |
+            AdapterCapability.SELF_INTERSECTION
         )
 
     @property
@@ -204,11 +205,41 @@ class PyMeshLabAdapter(MeshAdapter):
         return len(issues) == 0, issues
 
     def get_boundary_edges(self, meshset: 'pymeshlab.MeshSet') -> np.ndarray:
-        """Get boundary (non-manifold) edges."""
-        meshset.select_non_manifold_edges()
-        selected = meshset.selected_vertices()
-        meshset.mesh_unselect_all()
-        return np.array(selected)
+        """Get boundary edges.
+        
+        Boundary edges are edges that belong to only one face.
+        
+        Args:
+            meshset: PyMeshLab MeshSet
+            
+        Returns:
+            Array of boundary edge vertex pairs, shape (N, 2)
+        """
+        mesh = meshset.current_mesh()
+        faces = mesh.face_matrix()  # (F, 3) array for triangular meshes
+        
+        if faces is None or len(faces) == 0:
+            return np.array([]).reshape(0, 2)
+        
+        # Build edge-to-face count map
+        edge_count = {}
+        for face in faces:
+            # Three edges per triangle
+            edges = [
+                (int(min(face[0], face[1])), int(max(face[0], face[1]))),
+                (int(min(face[1], face[2])), int(max(face[1], face[2]))),
+                (int(min(face[2], face[0])), int(max(face[2], face[0]))),
+            ]
+            for edge in edges:
+                edge_count[edge] = edge_count.get(edge, 0) + 1
+        
+        # Boundary edges have count == 1
+        boundary_edges = [list(edge) for edge, count in edge_count.items() if count == 1]
+        
+        if not boundary_edges:
+            return np.array([]).reshape(0, 2)
+        
+        return np.array(boundary_edges)
 
     def get_nonmanifold_edges(self, meshset: 'pymeshlab.MeshSet') -> List[Tuple[int, int, int]]:
         """Detect non-manifold edges."""

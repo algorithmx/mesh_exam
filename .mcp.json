@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "mesh-examiner": {
+      "type": "stdio",
+      "command": "/home/dabajabaza/anaconda3/envs/PEEC/bin/python",
+      "args": [
+        "-c",
+        "from mesh_issue_examiner.mcp.server import create_mcp_server; create_mcp_server().run()"
+      ],
+      "env": {}
+    }
+  }
+}

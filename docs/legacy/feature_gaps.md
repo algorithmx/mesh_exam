@@ -4,14 +4,15 @@ Date: 2026-04-10 (updated with Thingi10K cross-validation results)
 
 ## Summary
 
-The mesh examiner registers 8 operations, but several common mesh defects
-present in the `e2e/sample_meshes/` test suite are not detected. This document
-catalogues every gap, the evidence, and what would be needed to close each one.
+The mesh examiner registers 14 operations. Previously identified detection
+gaps have been progressively closed. This document catalogues each gap,
+the evidence, and its resolution status.
 
 **Thingi10K cross-validation** (9995 real-world meshes) confirms and quantifies
 these gaps with ground-truth metadata. Cross-validated detectors:
 `edge_manifold` (Precision=1.0, Recall=1.0), `self_intersecting` (Precision=0.0,
-Recall=0.0). Untestable due to missing detectors: `closed`, `oriented`.
+Recall=0.0). Now testable: `closed` (via `detect_boundary_edges`),
+`oriented` (via `detect_inconsistent_orientation`).
 
 ---
 
@@ -91,8 +92,14 @@ common defect and the one most in need of a reliable detector.
 | Operation ID | Category | Scope |
 |---|---|---|
 | `topology.detect_nonmanifold_edges` | topological | Surface |
+| `topology.detect_nonmanifold_vertices` | topological | Surface |
 | `topology.detect_self_intersections` | topological | Surface |
 | `topology.detect_duplicate_vertices` | topological | Surface |
+| `topology.detect_boundary_edges` | topological | Surface |
+| `topology.detect_inconsistent_orientation` | orientation | Surface |
+| `topology.detect_disconnected_components` | topological | Surface |
+| `topology.detect_isolated_vertices` | topological | Surface |
+| `topology.detect_duplicate_faces` | topological | Surface |
 | `quality.compute_cell_quality` | quality | Surface |
 | `topology_3d.detect_nonmanifold_faces` | topological | Volumetric |
 | `quality_3d.check_orientation_consistency` | orientation | Volumetric |
@@ -101,10 +108,10 @@ common defect and the one most in need of a reliable detector.
 
 ---
 
-## Undetected Defects
+## Resolved Defect Detection Gaps
 
-The following sample meshes pass inspection despite containing known defects.
-Each is verified by the e2e test class `TestUndetectedDefects` in
+The following defects were previously undetected. All have since been
+implemented and are verified by the e2e test class `TestDefectiveMeshes` in
 `test_sample_meshes_e2e.py`.
 
 ### 1. Non-manifold vertex ✅ RESOLVED
@@ -180,40 +187,64 @@ than one connected component, the vertex is non-manifold.
 - `perfect_cube_surface`: No issues detected (consistent) ✓
 - `torus`: No issues detected (consistent) ✓
 
-### 3. Disconnected components
+### 3. Disconnected components ✅ RESOLVED
 
 - **Sample mesh:** `disconnected_components/` — three separate components that
   share no vertices or edges.
 - **What should happen:** For a mesh expected to be a single connected surface,
   multiple disconnected components may indicate a modeling error or
   misassembly.
-- **Why it's missed:** No operation checks mesh connectivity or counts
-  connected components.
-- **Required work:** Implement a connected-component analysis (BFS/DFS over the
-  vertex-face adjacency graph). Report when the mesh has more than one
-  component, ideally with vertex/face counts per component.
+- **Resolution:** Implemented `topology.detect_disconnected_components` operation.
 
-### 4. Isolated vertices
+**Operation ID**: `topology.detect_disconnected_components`
+
+**Algorithm**: Union-Find (Disjoint Set Union) over edge-connected vertices.
+For each face, union all vertex pairs that form edges. After processing all
+faces, count distinct root sets. O(V + F * k) with path compression.
+
+**Metrics Provided**:
+- `component_count`: Number of disconnected components
+- `largest_component_vertices`: Vertex count of largest component
+- `largest_component_faces`: Face count of largest component
+- `is_connected`: Boolean (True if single component)
+
+### 4. Isolated vertices ✅ RESOLVED
 
 - **Sample mesh:** `isolated_vertices/` — vertices that are not referenced by
   any face.
 - **What should happen:** Vertices not belonging to any face waste memory and
   indicate incomplete mesh construction.
-- **Why it's missed:** No operation checks for unreferenced vertices.
-- **Required work:** Simple check — compare the set of all vertex indices
-  against the set of indices used in the face array. Report any vertex index
-  that appears in the vertex array but not in any face.
+- **Resolution:** Implemented `topology.detect_isolated_vertices` operation.
 
-### 5. Duplicate faces
+**Operation ID**: `topology.detect_isolated_vertices`
+
+**Algorithm**: Set-difference — collect all vertex indices used in the face
+array, subtract from the full vertex index set. O(V + F * k).
+
+**Metrics Provided**:
+- `isolated_vertex_count`: Number of isolated vertices
+- `violation_rate`: Ratio of isolated vertices to total vertices
+- `total_vertices`: Total vertex count
+
+### 5. Duplicate faces ✅ RESOLVED
 
 - **Sample mesh:** `duplicate_vertices/` — the OBJ file contains two identical
   faces referencing the same three vertices. (The duplicate *vertices* were
   merged by the OBJ loader, so `detect_duplicate_vertices` finds nothing.)
-- **What should happen:** Duplicate faces (same vertex indices, same winding)
-  should be flagged.
-- **Why it's missed:** No operation checks for duplicate faces.
-- **Required work:** Hash or sort each face's vertex indices; detect
-  duplicates.
+- **What should happen:** Duplicate faces (same vertex indices, regardless of
+  winding order) should be flagged.
+- **Resolution:** Implemented `topology.detect_duplicate_faces` operation.
+
+**Operation ID**: `topology.detect_duplicate_faces`
+
+**Algorithm**: Canonical sorted-key hash — for each face, sort vertex indices
+to produce a canonical key. Track seen keys; any face whose key was already
+seen is a duplicate. O(F * k log k).
+
+**Metrics Provided**:
+- `duplicate_face_count`: Number of duplicate faces
+- `unique_face_groups`: Number of vertex sets appearing more than once
+- `violation_rate`: Ratio of duplicate faces to total faces
 
 ---
 
@@ -228,11 +259,8 @@ The reason it fires zero issues on the `duplicate_vertices` sample mesh is that
 the OBJ format uses shared vertex indices. The file contains two identical
 faces `[0,1,2] [0,1,2]`, but only 3 unique vertex positions — no duplicate
 *vertices* exist in the loaded array. The defect in this file is actually
-duplicate *faces*, not duplicate *vertices*.
-
-The dedicated test meshes `test_duplicates_positive/` and
-`test_duplicates_negative/` in `e2e/sample_meshes/` appear to have been created
-to address this but are not wired into any test.
+duplicate *faces*, not duplicate *vertices*. This is now detected by the
+`topology.detect_duplicate_faces` operation.
 
 ---
 
@@ -245,9 +273,9 @@ to address this but are not wired into any test.
 | **Boundary edges (open meshes)** | **High** | **Can't detect open vs closed meshes** | **closed: 88.6% True (1135 open meshes untestable)** | **✅ RESOLVED** |
 | **Self-intersection FP on open meshes** | **Critical** | **50 false issues on a single open mesh** | **Fixed: 0% FP rate on sample meshes** | **✅ RESOLVED** |
 | Quality metrics not returned | Medium | Metrics endpoint empty for surface meshes | metric_count=0 on all sampled surface meshes | Open |
-| Disconnected components | Medium | May be intentional (assembly); should at least be reported | — | Open |
-| Isolated vertices | Low | Cosmetic; wastes memory | — | Open |
-| Duplicate faces | Low | Usually harmless but indicates data quality issues | — | Open |
+| Disconnected components | Medium | May be intentional (assembly); should at least be reported | — | ✅ RESOLVED |
+| Isolated vertices | Low | Cosmetic; wastes memory | — | ✅ RESOLVED |
+| Duplicate faces | Low | Usually harmless but indicates data quality issues | — | ✅ RESOLVED |
 
 ### Resolved: Boundary Edge Detection
 
