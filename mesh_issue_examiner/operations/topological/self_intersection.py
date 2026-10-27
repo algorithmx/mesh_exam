@@ -19,6 +19,7 @@ from ...core.models import (
 )
 from ..base import BaseOperation, OperationMetadata
 from ..operation_registry import registry
+from ...adapters.exceptions import MeshConversionError
 
 
 class SelfIntersectionDetection(BaseOperation):
@@ -71,9 +72,14 @@ class SelfIntersectionDetection(BaseOperation):
         if len(mesh.faces) == 0:
             return []
         
-        # Get adapter and convert to native format
+        # Get adapter and convert to native format. Some element types
+        # (e.g. 'pyramid14') have no VTK equivalent; skip gracefully
+        # rather than failing the whole inspection.
         adapter = get_adapter(self.config.library_preference or 'pyvista')
-        native_mesh = adapter.from_canonical(mesh)
+        try:
+            native_mesh = adapter.from_canonical(mesh)
+        except MeshConversionError:
+            return []
         
         # Get self-intersections from adapter using manual method
         try:

@@ -17,11 +17,15 @@ ELEMENT_NODE_COUNT: Dict[str, int] = {
     'hex8': 8,
     'prism6': 6,
     'pyramid5': 5,
-    # Quadratic elements
+    # Quadratic elements (serendipity/incomplete: edge nodes only)
     'tet10': 10,
     'hex20': 20,
     'prism15': 15,
     'pyramid13': 13,
+    # Complete (Lagrange) quadratic elements
+    'hex27': 27,
+    'wedge18': 18,
+    'pyramid14': 14,
 }
 
 # Reverse map: node count -> default element type name
@@ -56,6 +60,15 @@ def get_cell_type_map() -> Dict[str, int]:
                 'hex20': pv.CellType.QUADRATIC_HEXAHEDRON,
                 'prism15': pv.CellType.QUADRATIC_WEDGE,
                 'pyramid13': pv.CellType.QUADRATIC_PYRAMID,
+                # Complete (Lagrange) quadratic elements
+                'hex27': pv.CellType.TRIQUADRATIC_HEXAHEDRON,
+                'wedge18': pv.CellType.BIQUADRATIC_QUADRATIC_WEDGE,
+                # NOTE: 'pyramid14' has no VTK equivalent (VTK's tri-quadratic
+                # pyramid, TRIQUADRATIC_PYRAMID, has 19 nodes).  pyramid14 is
+                # therefore registered for connectivity-level analysis only
+                # (topology_3d ops); native conversion via
+                # ``get_native('pyvista')`` raises MeshConversionError, which
+                # quality_3d operations handle by skipping gracefully.
             }
         except ImportError as e:
             raise ImportError(

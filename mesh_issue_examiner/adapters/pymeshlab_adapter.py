@@ -430,7 +430,7 @@ class PyMeshLabAdapter(MeshAdapter):
             grid = mesh_input.get_native('pyvista')
             
             # Extract surface
-            surface = grid.extract_surface()
+            surface = grid.extract_surface(algorithm='dataset_surface')
             
             # Get vertices and faces
             vertices = surface.points

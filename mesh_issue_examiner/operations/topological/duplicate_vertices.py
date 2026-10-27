@@ -19,6 +19,7 @@ from ...core.models import (
 from ..base import BaseOperation, OperationMetadata
 from ..operation_registry import registry
 from ...utils.metrics import determine_severity
+from ...adapters.exceptions import MeshConversionError
 
 
 class DuplicateVertexDetection(BaseOperation):
@@ -86,6 +87,34 @@ class DuplicateVertexDetection(BaseOperation):
             tags=['topology', 'cleanup', 'vertices', 'duplicate', 'weld']
         )
 
+    @staticmethod
+    def _find_duplicate_vertices_numpy(
+        vertices: np.ndarray, tolerance: float
+    ) -> List[int]:
+        """Find duplicate vertices directly from coordinates.
+
+        Fallback used when the mesh cannot be converted to a native
+        representation (e.g. connectivity-only element types such as
+        'pyramid14'). Groups vertices by tolerance-rounded coordinates;
+        within each group, all but the first vertex are reported as
+        duplicates. Note that rounding can, in rare boundary cases,
+        miss a pair straddling a rounding cell boundary.
+        """
+        vertices = np.asarray(vertices, dtype=float)
+        if len(vertices) == 0:
+            return []
+
+        scale = 1.0 / max(tolerance, 1e-12)
+        keys = np.round(vertices * scale).astype(np.int64)
+        _, first_idx, inverse, counts = np.unique(
+            keys, axis=0,
+            return_index=True, return_inverse=True, return_counts=True,
+        )
+        is_duplicate = (counts[inverse] > 1) & (
+            first_idx[inverse] != np.arange(len(vertices))
+        )
+        return [int(i) for i in np.where(is_duplicate)[0]]
+
     def execute(self, mesh: MeshInput) -> List[MeshIssue]:
         """Execute duplicate vertex detection."""
         from ...adapters.factory import get_adapter
@@ -104,11 +133,20 @@ class DuplicateVertexDetection(BaseOperation):
             else:
                 return []
 
-        # Convert to native mesh
-        native_mesh = adapter.from_canonical(mesh)
-
-        # Find duplicate vertices
-        duplicate_indices = adapter.get_duplicate_vertices(native_mesh, self.tolerance)
+        # Convert to native mesh. Some element types (e.g. 'pyramid14')
+        # have no VTK equivalent, so native conversion can fail with
+        # MeshConversionError. Duplicate detection is purely
+        # coordinate-based, so fall back to a direct numpy computation
+        # on the canonical vertices in that case.
+        try:
+            native_mesh = adapter.from_canonical(mesh)
+            duplicate_indices = adapter.get_duplicate_vertices(
+                native_mesh, self.tolerance
+            )
+        except MeshConversionError:
+            duplicate_indices = self._find_duplicate_vertices_numpy(
+                mesh.vertices, self.tolerance
+            )
 
         if not duplicate_indices:
             return []

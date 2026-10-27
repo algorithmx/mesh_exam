@@ -21,6 +21,7 @@ from ...core.models import (
 from ...utils.metrics import compute_percentile_stats
 from ..base import BaseOperation, OperationMetadata
 from ..operation_registry import registry
+from ...adapters.exceptions import MeshConversionError
 
 
 class CellQualityComputation(BaseOperation):
@@ -101,8 +102,16 @@ class CellQualityComputation(BaseOperation):
                         f"None of the supported libraries are available: {self.metadata.supported_libraries}"
                     )
         
-        native_mesh = adapter.from_canonical(mesh)
+        # Some element types (e.g. 'pyramid14') have no VTK equivalent;
+        # skip gracefully rather than failing the whole inspection.
+        try:
+            native_mesh = adapter.from_canonical(mesh)
+        except MeshConversionError as e:
+            logger.warning(f"Skipping cell quality computation: {e}")
+            self.last_quality_metrics = []
+            return []
 
+        self.last_quality_metrics = []
         issues = []
 
         # Metrics where higher values are worse (violation if value > threshold)
@@ -131,6 +140,19 @@ class CellQualityComputation(BaseOperation):
                 
                 total = len(valid_values)
                 violation_rate = violations / total if total > 0 else 0
+
+                # Always surface the metric distribution (even with zero
+                # violations) so mesh_get_quality_metrics returns live data.
+                qm = QualityMetrics(
+                    operation_id=f'{self.metadata.operation_id}.{quality_type}',
+                    metric_name=quality_type,
+                    values=valid_values,
+                    threshold=threshold,
+                )
+                # Authoritative count consistent with issue reporting
+                # (handles metric direction quirks uniformly).
+                qm.violation_count = violations
+                self.last_quality_metrics.append(qm)
 
                 # Determine severity
                 severity = self._determine_severity(violation_rate)

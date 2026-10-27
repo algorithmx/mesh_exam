@@ -28,9 +28,11 @@ from ...core.models import (
     IssueCategory,
     IssueSeverity,
     OperationConfig,
+    QualityMetrics,
 )
 from ..base import BaseOperation, OperationMetadata
 from ..operation_registry import registry
+from ...adapters.exceptions import MeshConversionError
 
 logger = logging.getLogger(__name__)
 
@@ -48,25 +50,31 @@ EXTENDED_QUALITY_TYPES = [
     # 'min_dihedral_angle', 'max_dihedral_angle',
 ]
 
+# Quadratic element types whose VTK equivalents support quality
+# computation (corner-first node ordering; pyramid14 has no VTK cell).
+_QUAD_VTK = ['tet10', 'hex20', 'hex27', 'prism15', 'wedge18', 'pyramid13']
+
 # Element-specific metric applicability
 # Maps metric name to list of element types that support it
 METRIC_ELEMENT_SUPPORT: Dict[str, List[str]] = {
-    # All element types
-    'scaled_jacobian': ['tet4', 'hex8', 'prism6', 'pyramid5'],
-    'volume': ['tet4', 'hex8', 'prism6', 'pyramid5'],
-    'aspect_ratio': ['tet4', 'hex8', 'prism6', 'pyramid5'],
-    'condition': ['tet4', 'hex8', 'prism6', 'pyramid5'],
-    'shape': ['tet4', 'hex8', 'prism6', 'pyramid5'],
-    'skewness': ['tet4', 'hex8', 'prism6', 'pyramid5'],
-    'skew': ['tet4', 'hex8', 'prism6', 'pyramid5'],
-    'stretch': ['tet4', 'hex8', 'prism6', 'pyramid5'],
-    'collapse_ratio': ['tet4', 'hex8', 'prism6', 'pyramid5'],
-    'equiangle_skew': ['tet4', 'hex8', 'prism6', 'pyramid5'],
-    'radius_ratio': ['tet4'],  # Primary for tets
-    # Hex elements with quad faces
-    'warpage': ['hex8', 'prism6', 'pyramid5'],
-    'taper': ['hex8'],
-    'orthogonality': ['hex8', 'prism6'],
+    # All element types (linear + quadratic)
+    'scaled_jacobian': ['tet4', 'hex8', 'prism6', 'pyramid5'] + _QUAD_VTK,
+    'volume': ['tet4', 'hex8', 'prism6', 'pyramid5'] + _QUAD_VTK,
+    'aspect_ratio': ['tet4', 'hex8', 'prism6', 'pyramid5'] + _QUAD_VTK,
+    'condition': ['tet4', 'hex8', 'prism6', 'pyramid5'] + _QUAD_VTK,
+    'shape': ['tet4', 'hex8', 'prism6', 'pyramid5'] + _QUAD_VTK,
+    'skewness': ['tet4', 'hex8', 'prism6', 'pyramid5'] + _QUAD_VTK,
+    'skew': ['tet4', 'hex8', 'prism6', 'pyramid5'] + _QUAD_VTK,
+    'stretch': ['tet4', 'hex8', 'prism6', 'pyramid5'] + _QUAD_VTK,
+    'collapse_ratio': ['tet4', 'hex8', 'prism6', 'pyramid5'] + _QUAD_VTK,
+    'equiangle_skew': ['tet4', 'hex8', 'prism6', 'pyramid5'] + _QUAD_VTK,
+    'radius_ratio': ['tet4', 'tet10'],  # Primary for tets
+    # Elements with quad faces
+    'warpage': ['hex8', 'prism6', 'pyramid5',
+                'hex20', 'hex27', 'prism15', 'wedge18', 'pyramid13'],
+    'taper': ['hex8', 'hex20', 'hex27'],
+    'orthogonality': ['hex8', 'prism6',
+                      'hex20', 'hex27', 'prism15', 'wedge18'],
 }
 
 # Industry-standard thresholds for quality metrics
@@ -171,13 +179,28 @@ class VolumeCellQualityComputation(BaseOperation):
         
         Metrics that are not applicable to the mesh's element types
         are skipped with a warning (if skip_unsupported_metrics=True).
+
+        Every computed metric is also surfaced as a QualityMetrics
+        distribution via ``self.last_quality_metrics`` (including
+        zero-violation metrics), so the mesh_get_quality_metrics
+        endpoint returns live data for volumetric meshes.
         """
+        self.last_quality_metrics = []
         if not mesh.has_volume_cells:
             return []
 
         from ...adapters.factory import get_adapter
         adapter = get_adapter('pyvista')
-        grid = mesh.get_native('pyvista')
+        try:
+            grid = mesh.get_native('pyvista')
+        except MeshConversionError as exc:
+            # Mesh contains element types with no VTK equivalent (e.g.
+            # pyramid14); volume quality metrics need native computation.
+            logger.warning(
+                'Skipping volume cell quality metrics (no VTK equivalent '
+                'for some element types): %s', exc,
+            )
+            return []
 
         issues: List[MeshIssue] = []
         
@@ -217,6 +240,19 @@ class VolumeCellQualityComputation(BaseOperation):
                 violation_mask = valid_values < threshold
             violations = int(np.sum(violation_mask))
             total = len(valid_values)
+
+            # Always surface the metric distribution (even with zero
+            # violations) so mesh_get_quality_metrics returns live data.
+            qm = QualityMetrics(
+                operation_id=f'{self.metadata.operation_id}.{quality_type}',
+                metric_name=quality_type,
+                values=valid_values,
+                threshold=threshold,
+            )
+            # Authoritative count consistent with issue reporting
+            # (handles metric direction quirks uniformly).
+            qm.violation_count = violations
+            self.last_quality_metrics.append(qm)
 
             if violations == 0:
                 continue

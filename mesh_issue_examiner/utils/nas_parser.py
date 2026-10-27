@@ -1,12 +1,19 @@
 """
 NASTRAN BDF/NAS file parser.
 
-Parses GRID, CTRIA3, CQUAD4, and CTETRA cards from NASTRAN Bulk Data files
-and converts them to triangular surface mesh arrays (vertices Nx3, faces Mx3).
+Parses GRID, CTRIA3, CQUAD4, CTETRA, CHEXA, and CPENTA cards from NASTRAN
+Bulk Data files and converts them to triangular surface mesh arrays
+(vertices Nx3, faces Mx3).
 
 Supports:
 - Free-field format (comma-separated)
 - Short-field format (8-character fixed columns)
+- Continuation cards for multi-card entries (CHEXA, CPENTA)
+
+Volume elements are preserved in ``volume_cells`` as corner connectivity:
+CTETRA -> 'tet4', CHEXA -> 'hex8' (8 corner nodes; midside nodes of the
+20-node form are parsed but dropped), CPENTA -> 'prism6' (6 corner nodes;
+midside nodes of the 15-node form are dropped).
 """
 
 from collections import Counter
@@ -20,9 +27,11 @@ def parse_nas(file_path: str) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndar
     """
     Parse a NASTRAN BDF/NAS file into surface mesh arrays and volumetric cells.
 
-    Volume elements (CTETRA) are decomposed into triangular faces for the
-    boundary surface, and their raw node connectivity is preserved in
-    ``volume_cells`` for volumetric analysis.
+    Volume elements (CTETRA, CHEXA, CPENTA) are decomposed into triangular
+    faces for the boundary surface, and their corner node connectivity is
+    preserved in ``volume_cells`` for volumetric analysis ('tet4', 'hex8',
+    'prism6'). Midside nodes of higher-order CHEXA/CPENTA forms are parsed
+    but not retained.
 
     Args:
         file_path: Path to .nas or .bdf file.
@@ -42,54 +51,81 @@ def parse_nas(file_path: str) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndar
 
     in_bulk = False
     with open(file_path, 'r') as f:
-        for line in f:
-            raw = line.rstrip('\n\r')
+        lines = f.readlines()
 
-            # Skip until BEGIN BULK
-            if not in_bulk:
-                if raw.strip().upper().startswith('BEGIN BULK'):
-                    in_bulk = True
-                continue
+    i = 0
+    n_lines = len(lines)
+    while i < n_lines:
+        raw = lines[i].rstrip('\n\r')
+        i += 1
 
-            # End of bulk data
-            stripped = raw.strip().upper()
-            if stripped.startswith('ENDATA') or stripped.startswith('ENDDATA'):
-                break
+        # Skip until BEGIN BULK
+        if not in_bulk:
+            if raw.strip().upper().startswith('BEGIN BULK'):
+                in_bulk = True
+            continue
 
-            # Skip comments and blank lines
-            if not raw or raw.startswith('$'):
-                continue
+        # End of bulk data
+        stripped = raw.strip().upper()
+        if stripped.startswith('ENDATA') or stripped.startswith('ENDDATA'):
+            break
 
-            # Determine card keyword (first 8 chars or first comma-delimited field)
-            if ',' in raw:
-                fields = _parse_free_field(raw)
-            else:
-                fields = _parse_short_field(raw)
+        # Skip comments and blank lines
+        if not raw or raw.startswith('$'):
+            continue
 
-            if not fields:
-                continue
+        # Determine card keyword (first 8 chars or first comma-delimited field)
+        if ',' in raw:
+            fields = _parse_free_field(raw)
+        else:
+            fields = _parse_short_field(raw)
 
-            keyword = fields[0].upper()
+        if not fields:
+            continue
 
-            if keyword == 'GRID':
-                _parse_grid(fields, nodes)
+        keyword = fields[0].upper()
 
-            elif keyword == 'CTRIA3':
-                face = _parse_ctria3(fields)
-                if face:
-                    surface_faces.append(face)
+        if keyword == 'GRID':
+            _parse_grid(fields, nodes)
 
-            elif keyword == 'CQUAD4':
-                tris = _parse_cquad4(fields)
-                if tris:
-                    surface_faces.extend(tris)
+        elif keyword == 'CTRIA3':
+            face = _parse_ctria3(fields)
+            if face:
+                surface_faces.append(face)
 
-            elif keyword == 'CTETRA':
-                result = _parse_ctetra_volumetric(fields)
-                if result is not None:
-                    tris, cell_nodes = result
-                    volume_faces.extend(tris)
-                    volume_cells_raw.setdefault('tet4', []).append(cell_nodes)
+        elif keyword == 'CQUAD4':
+            tris = _parse_cquad4(fields)
+            if tris:
+                surface_faces.extend(tris)
+
+        elif keyword == 'CTETRA':
+            result = _parse_ctetra_volumetric(fields)
+            if result is not None:
+                tris, cell_nodes = result
+                volume_faces.extend(tris)
+                volume_cells_raw.setdefault('tet4', []).append(cell_nodes)
+
+        elif keyword in ('CHEXA', 'CPENTA'):
+            # Multi-card entries: gather continuation cards (first field
+            # starts with '+') before parsing the node list.
+            n_corners = 8 if keyword == 'CHEXA' else 6
+            etype = 'hex8' if keyword == 'CHEXA' else 'prism6'
+            node_fields = list(fields[3:])
+            while i < n_lines:
+                nxt_raw = lines[i].rstrip('\n\r')
+                if not nxt_raw or nxt_raw.startswith('$'):
+                    break
+                nxt_fields = (_parse_free_field(nxt_raw) if ',' in nxt_raw
+                              else _parse_short_field(nxt_raw))
+                if not nxt_fields or not nxt_fields[0].upper().startswith('+'):
+                    break
+                i += 1
+                node_fields.extend(nxt_fields[1:])
+            result = _parse_volume_corners(node_fields, n_corners, etype)
+            if result is not None:
+                tris, cell_nodes = result
+                volume_faces.extend(tris)
+                volume_cells_raw.setdefault(etype, []).append(cell_nodes)
 
     if not nodes:
         raise ValueError(f"No GRID cards found in {file_path}")
@@ -229,6 +265,57 @@ def _parse_ctetra_volumetric(fields: List[str]) -> tuple | None:
         return faces, [g1, g2, g3, g4]
     except (IndexError, ValueError):
         return None
+
+
+# Corner node order matches the VTK hex8 convention (G5-G8 above G1-G4).
+_HEX_QUADS = [
+    (0, 1, 2, 3), (4, 5, 6, 7),
+    (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7),
+]
+
+# Corner node order matches the VTK wedge convention (G4-G6 above G1-G3).
+_PRISM_TRIS = [(0, 1, 2), (3, 4, 5)]
+_PRISM_QUADS = [(0, 1, 4, 3), (1, 2, 5, 4), (2, 0, 3, 5)]
+
+
+def _parse_volume_corners(node_fields: List[str], n_corners: int,
+                          etype: str) -> tuple | None:
+    """Parse CHEXA/CPENTA node fields into corner connectivity + faces.
+
+    ``node_fields`` is the concatenation of the parent card's node fields
+    (from field 4 on, i.e. after keyword/EID/PID) and any continuation-card
+    node fields. Continuation markers (fields starting with '+') are
+    ignored; only the first ``n_corners`` integers are kept (midside nodes
+    of the 20-node CHEXA / 15-node CPENTA forms are dropped).
+
+    Returns:
+        Tuple of (triangular_faces, corner_node_list) or None if fewer than
+        ``n_corners`` valid node IDs are present.
+    """
+    nodes: List[int] = []
+    for f in node_fields:
+        if f.startswith('+'):
+            continue
+        try:
+            nodes.append(int(f))
+        except ValueError:
+            continue
+    if len(nodes) < n_corners:
+        return None
+    corners = nodes[:n_corners]
+
+    tris: List[Tuple[int, int, int]] = []
+    if etype == 'hex8':
+        for a, b, c, d in _HEX_QUADS:
+            tris.append((corners[a], corners[b], corners[c]))
+            tris.append((corners[a], corners[c], corners[d]))
+    else:  # prism6
+        for a, b, c in _PRISM_TRIS:
+            tris.append((corners[a], corners[b], corners[c]))
+        for a, b, c, d in _PRISM_QUADS:
+            tris.append((corners[a], corners[b], corners[c]))
+            tris.append((corners[a], corners[c], corners[d]))
+    return tris, corners
 
 
 # ---------------------------------------------------------------------------

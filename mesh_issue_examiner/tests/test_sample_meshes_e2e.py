@@ -2,6 +2,14 @@
 End-to-end tests loading real mesh files from e2e/sample_meshes/
 through the full pipeline: load -> inspect -> get_issues -> get_quality_metrics.
 
+The fixture files are deterministic and NOT committed (e2e/ is gitignored).
+They are regenerated automatically on the first test session by
+``tests/conftest.py`` (via scripts/generate_sample_meshes.py, which skips
+files that already exist). To rebuild them by hand:
+
+    python scripts/generate_sample_meshes.py --force   # recreate + verify
+    python scripts/generate_sample_meshes.py --verify  # verify only
+
 Run with:
     conda run -n PEEC python -m pytest mesh_issue_examiner/tests/test_sample_meshes_e2e.py -v
 """
@@ -236,6 +244,183 @@ class TestDefectiveMeshes:
         for kw in case["expect_keywords"]:
             assert any(kw in oid for oid in op_ids), (
                 f"{mesh_name}: expected '{kw}' in operation IDs, got {op_ids}"
+            )
+
+
+# ===================================================================
+# 3b. Volumetric (.vtu) meshes — topology_3d connectivity defects
+# ===================================================================
+
+VOLUME_CASES = {
+    # Clean 2x2x2 hex grid: the three connectivity ops must stay silent.
+    # The legacy quality_3d ops (check_orientation_consistency,
+    # check_boundary_layer) misfire on regular hex grids, so passed is
+    # False for every volume fixture (see docs/volumetric-mesh-gaps-report.md).
+    "closed_volume": {
+        "expect_passed": False,
+        "expect_keywords": [],
+        "forbid_keywords": ["duplicate_cells", "orphaned_cells",
+                            "boundary_closure", "nonmanifold_faces"],
+    },
+    "duplicate_cell": {
+        "expect_passed": False,
+        "expect_keywords": ["duplicate_cells", "boundary_closure"],
+        "forbid_keywords": ["orphaned_cells"],
+    },
+    "leaky_volume": {
+        "expect_passed": False,
+        "expect_keywords": ["boundary_closure"],
+        "forbid_keywords": ["duplicate_cells", "orphaned_cells",
+                            "nonmanifold_faces"],
+    },
+    # Clean quadratic (tet10) volume: connectivity ops stay silent and
+    # vtkCellQuality's -1 sentinel for quadratic tets must not be read as
+    # an inverted cell.
+    "tet10_volume": {
+        "expect_passed": True,
+        "expect_keywords": [],
+        "forbid_keywords": ["duplicate_cells", "orphaned_cells",
+                            "boundary_closure", "nonmanifold_faces",
+                            "check_orientation_consistency"],
+    },
+}
+
+
+class TestVolumeMeshes:
+    """Hex8 .vtu volumes exercising the volumetric connectivity ops."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mesh_name", list(VOLUME_CASES))
+    async def test_volume_mesh_loads(self, mesh_name):
+        server = _server()
+        load, inspect, _ = await _load_inspect_get_issues(server, mesh_name, fmt="vtu")
+        assert load["n_vertices"] > 0
+        assert inspect["summary"]["total_issues"] > 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mesh_name", list(VOLUME_CASES))
+    async def test_volume_connectivity_contract(self, mesh_name):
+        """Keyword contracts for the volumetric connectivity ops."""
+        case = VOLUME_CASES[mesh_name]
+        server = _server()
+        _, inspect, issues = await _load_inspect_get_issues(server, mesh_name, fmt="vtu")
+        assert inspect["passed"] == case["expect_passed"]
+        op_ids = {i["operation_id"] for i in issues["issues"]}
+        for kw in case["expect_keywords"]:
+            assert any(kw in oid for oid in op_ids), (
+                f"{mesh_name}: expected '{kw}' in operation IDs, got {op_ids}"
+            )
+        for kw in case["forbid_keywords"]:
+            assert not any(kw in oid for oid in op_ids), (
+                f"{mesh_name}: unexpected '{kw}' in operation IDs, got {op_ids}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_volume_quality_metrics_surfaced(self):
+        """Phase-1 regression: metrics surface end-to-end for volumes too."""
+        server = _server()
+        load, _, _ = await _load_inspect_get_issues(server, "closed_volume", fmt="vtu")
+        resp = await server.handle_request(MCPRequest(
+            method="mesh_get_quality_metrics",
+            params={"mesh_id": load["mesh_id"]},
+        ))
+        assert resp.error is None, f"get_quality_metrics failed: {resp.error}"
+        assert resp.result["metric_count"] >= 1, (
+            f"expected quality metrics for closed_volume, "
+            f"got {resp.result['metric_count']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_tet10_topology_matches_tet4_corners(self):
+        """tet10 topology must match the corner-equivalent tet4 mesh.
+
+        VTK quadratic node ordering places corner nodes first, so the
+        corner-only tet4 mesh with identical corner ordering must produce
+        exactly the same connectivity/orientation results.
+        """
+        import numpy as np
+        from mesh_issue_examiner.core.models import MeshInput
+        from mesh_issue_examiner.operations.operation_registry import registry
+
+        compare_ops = [
+            "topology_3d.detect_duplicate_cells",
+            "topology_3d.detect_orphaned_cells",
+            "topology_3d.check_boundary_closure",
+            "topology_3d.detect_nonmanifold_faces",
+            "quality_3d.check_orientation_consistency",
+        ]
+
+        server = _server()
+        _, inspect, issues = await _load_inspect_get_issues(
+            server, "tet10_volume", fmt="vtu")
+        assert inspect["passed"] is True
+        tet10_op_ids = {
+            i["operation_id"] for i in issues["issues"]
+            if i["operation_id"] in compare_ops
+        }
+
+        # Corner-equivalent tet4 mesh (same corners/order as tet10_volume;
+        # see scripts/generate_sample_meshes.py::tet10_volume).
+        corners = np.array([
+            [0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [0.25, 0.25, -1],
+        ], float)
+        tet4_mesh = MeshInput(
+            vertices=corners,
+            faces=np.zeros((0, 3), dtype=int),
+            mesh_id="tet4_corner_equivalent",
+            volume_cells={"tet4": np.array([[0, 1, 2, 3], [1, 0, 2, 4]])},
+        )
+        result4 = registry.create_workflow(compare_ops)(tet4_mesh)
+        tet4_op_ids = {i.operation_id for i in result4.issues}
+
+        assert tet10_op_ids == tet4_op_ids == set(), (
+            f"topology mismatch: tet10={tet10_op_ids}, tet4={tet4_op_ids}"
+        )
+
+
+# ===================================================================
+# 3c. NASTRAN mixed volumetric deck (.nas): CTETRA + CHEXA + CPENTA
+# ===================================================================
+
+class TestNastranMixedVolume:
+    """The nas_mixed_volume fixture exercises CHEXA/CPENTA parsing."""
+
+    @pytest.mark.asyncio
+    async def test_mixed_element_types_parsed(self):
+        """CTETRA/CHEXA/CPENTA map to tet4/hex8/prism6 volume cells.
+
+        The fixture's CHEXA uses the 20-node form with continuation cards;
+        the parser must keep the 8 corners and drop the midside nodes
+        (18 vertices: 4 tet + 8 hex + 6 wedge corners).
+        """
+        from mesh_issue_examiner.utils.mesh_loader import load_mesh_from_file
+
+        mesh = load_mesh_from_file(_mesh_file("nas_mixed_volume", fmt="nas"))
+        assert mesh.has_volume_cells
+        assert set(mesh.cell_types) == {"tet4", "hex8", "prism6"}
+        assert mesh.volume_cells["tet4"].shape == (1, 4)
+        assert mesh.volume_cells["hex8"].shape == (1, 8)
+        assert mesh.volume_cells["prism6"].shape == (1, 6)
+        assert mesh.n_vertices == 18  # midside nodes dropped
+        assert mesh.n_volume_cells == 3
+
+    @pytest.mark.asyncio
+    async def test_pipeline_runs_and_connectivity_ops_silent(self):
+        """Full MCP pipeline on the .nas deck: three disjoint cells are
+        detected as disconnected, but no connectivity defects fire."""
+        server = _server()
+        load, inspect, issues = await _load_inspect_get_issues(
+            server, "nas_mixed_volume", fmt="nas")
+        assert load["format"] == "nas"
+        assert load["n_vertices"] == 18
+        assert inspect["passed"] is False
+
+        op_ids = {i["operation_id"] for i in issues["issues"]}
+        assert any("disconnected" in oid for oid in op_ids), op_ids
+        for kw in ("duplicate_cells", "orphaned_cells", "boundary_closure",
+                   "nonmanifold_faces", "check_orientation_consistency"):
+            assert not any(kw in oid for oid in op_ids), (
+                f"nas_mixed_volume: unexpected '{kw}' in operation IDs: {op_ids}"
             )
 
 

@@ -78,6 +78,11 @@ class BaseOperation(ABC):
         self.config = config or OperationConfig()
         self._execution_count = 0
         self._total_time = 0.0
+        # Metrics channel: operations that compute quality metric
+        # distributions populate this list during execute(). Workflows
+        # collect it after run() so InspectionResult.quality_metrics is
+        # populated alongside issues. Non-quality operations leave it empty.
+        self.last_quality_metrics: List[QualityMetrics] = []
 
     @property
     @abstractmethod
@@ -110,6 +115,7 @@ class BaseOperation(ABC):
         mesh._caching_enabled = active_config.enable_caching
         start_time = time.perf_counter()
         self._execution_count += 1
+        self.last_quality_metrics = []
 
         try:
             issues = self.execute(mesh)

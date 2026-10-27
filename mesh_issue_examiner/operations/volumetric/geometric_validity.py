@@ -24,6 +24,7 @@ from ...core.models import (
 from ..base import BaseOperation, OperationMetadata
 from ..operation_registry import registry
 from ...adapters.factory import get_adapter
+from ...adapters.exceptions import MeshConversionError
 
 
 class GeometricValidityAssessment(BaseOperation):
@@ -79,8 +80,18 @@ class GeometricValidityAssessment(BaseOperation):
         if not mesh.has_volume_cells:
             return issues
 
-        # 2. Get the PyVista UnstructuredGrid
-        grid = mesh.get_native('pyvista')
+        # 2. Get the PyVista UnstructuredGrid.  Meshes containing element
+        #    types with no VTK equivalent (e.g. pyramid14) cannot be
+        #    converted; geometric validity requires native volume
+        #    computation, so the check is skipped entirely.
+        try:
+            grid = mesh.get_native('pyvista')
+        except MeshConversionError as exc:
+            logger.warning(
+                'Skipping geometric validity check (no VTK equivalent for '
+                'some element types): %s', exc,
+            )
+            return issues
 
         # 3. Compute cell volumes via the adapter
         volumes = self._adapter.compute_cell_quality(grid, 'volume')

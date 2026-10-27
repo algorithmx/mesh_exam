@@ -8,6 +8,7 @@ Supports all linear element types: tet4, hex8, prism6, pyramid5, and
 mixed-element meshes.
 """
 
+import logging
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 
@@ -21,7 +22,10 @@ from ...core.models import (
 )
 from ..base import BaseOperation, OperationMetadata
 from ..operation_registry import registry
-from ._face_tables import ELEMENT_FACES
+from ...adapters.exceptions import MeshConversionError
+from ._face_tables import build_face_to_cell_map
+
+logger = logging.getLogger(__name__)
 
 
 class OrientationConsistencyCheck(BaseOperation):
@@ -39,6 +43,11 @@ class OrientationConsistencyCheck(BaseOperation):
        inconsistent, leading to assembly errors in FEA/CFD.
 
     Supports tet4, hex8, prism6, pyramid5, and mixed-element meshes.
+    Quadratic element types (tet10, hex20, hex27, prism15, wedge18,
+    pyramid13, pyramid14) participate in the winding check through their
+    corner nodes (VTK orders corner nodes first).  The inverted-element
+    check requires native (VTK) conversion and is skipped for meshes
+    containing element types without a VTK equivalent (e.g. pyramid14).
     """
 
     # Maximum number of IssueLocation objects per issue (avoids huge reports).
@@ -87,11 +96,22 @@ class OrientationConsistencyCheck(BaseOperation):
         if not mesh.has_volume_cells:
             return issues
 
-        # 2. Obtain pyvista UnstructuredGrid
-        grid = mesh.get_native('pyvista')
+        # 2. Obtain pyvista UnstructuredGrid.  Meshes containing element
+        #    types with no VTK equivalent (e.g. pyramid14) cannot be
+        #    converted; the inverted-element check is skipped but the
+        #    winding check (pure connectivity) still runs.
+        try:
+            grid = mesh.get_native('pyvista')
+        except MeshConversionError as exc:
+            logger.warning(
+                'Skipping inverted-element check (no VTK equivalent for '
+                'some element types): %s', exc,
+            )
+            grid = None
 
         # 3. Inverted-element detection (negative signed volume)
-        issues.extend(self._check_inverted_cells(mesh, grid))
+        if grid is not None:
+            issues.extend(self._check_inverted_cells(mesh, grid))
 
         # 4. Inconsistent face-winding detection
         issues.extend(self._check_winding_consistency(mesh))
@@ -123,6 +143,14 @@ class OrientationConsistencyCheck(BaseOperation):
                 volumes = self._compute_signed_volumes(mesh)
 
         if volumes is None or len(volumes) == 0:
+            return []
+
+        # Drop the vtkCellQuality sentinel (-1), which marks cells the
+        # filter cannot evaluate (e.g. quadratic tetrahedra).  Without
+        # this, every unsupported cell would be misreported as inverted.
+        volumes = np.asarray(volumes, dtype=float)
+        volumes = volumes[volumes != -1.0]
+        if len(volumes) == 0:
             return []
 
         tol = self.config.tolerance
@@ -230,11 +258,10 @@ class OrientationConsistencyCheck(BaseOperation):
     ) -> Dict[Tuple[int, ...], List[Tuple[int, Tuple[int, ...]]]]:
         """Build mapping from sorted face tuples to (cell_idx, oriented_face).
 
-        Iterates over all element types in ``mesh.volume_cells``.  For each
-        cell, extracts faces using the :data:`ELEMENT_FACES` table and
-        creates a canonical key by sorting vertex indices.  The original
-        (oriented) face tuple is stored alongside the global cell index so
-        that winding can be compared later.
+        Delegates to the shared :func:`build_face_to_cell_map`, which
+        resolves quadratic element types to their linear corner face
+        definitions and keeps global cell indices aligned with the mesh's
+        global cell numbering.
 
         Args:
             mesh: Input mesh with volumetric cells.
@@ -243,35 +270,7 @@ class OrientationConsistencyCheck(BaseOperation):
             Dictionary mapping sorted face tuples to lists of
             ``(global_cell_index, oriented_face_tuple)`` pairs.
         """
-        face_to_cells: Dict[
-            Tuple[int, ...],
-            List[Tuple[int, Tuple[int, ...]]],
-        ] = {}
-
-        global_cell_idx = 0
-
-        for element_type, connectivity in mesh.volume_cells.items():
-            if element_type not in ELEMENT_FACES:
-                # Skip unknown element types but advance global index
-                global_cell_idx += len(connectivity)
-                continue
-
-            face_defs = ELEMENT_FACES[element_type]
-            n_cells = len(connectivity)
-
-            for local_idx in range(n_cells):
-                cell_verts = connectivity[local_idx]
-
-                for face_def in face_defs:
-                    face = tuple(int(cell_verts[i]) for i in face_def)
-                    key = tuple(sorted(face))
-                    face_to_cells.setdefault(key, []).append(
-                        (global_cell_idx, face)
-                    )
-
-                global_cell_idx += 1
-
-        return face_to_cells
+        return build_face_to_cell_map(mesh)
 
     @staticmethod
     def _faces_are_reversed(

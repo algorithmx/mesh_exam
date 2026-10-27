@@ -157,7 +157,7 @@ class PyVistaAdapter(MeshAdapter):
             faces
         ]).ravel()
 
-        return pv.PolyData(vertices, face_arr)
+        return pv.PolyData(vertices, face_arr, force_float=False)
 
     def from_canonical(self, mesh_input: 'MeshInput') -> 'Union[pyvista.PolyData, pyvista.UnstructuredGrid]':
         """Create PyVista mesh from canonical format.
@@ -221,7 +221,7 @@ class PyVistaAdapter(MeshAdapter):
             mesh_input.faces
         ]).ravel()
         
-        return pv.PolyData(mesh_input.vertices, face_arr)
+        return pv.PolyData(mesh_input.vertices, face_arr, force_float=False)
 
     def get_vertices(self, mesh: 'pyvista.PolyData') -> np.ndarray:
         """Extract vertex array.
@@ -278,7 +278,7 @@ class PyVistaAdapter(MeshAdapter):
         if isinstance(mesh, pv.PolyData):
             faces = self.get_faces(mesh)
         elif isinstance(mesh, pv.UnstructuredGrid):
-            surf = mesh.extract_surface()
+            surf = mesh.extract_surface(algorithm='dataset_surface')
             if surf.n_cells > 0:
                 faces = self.get_faces(surf)
 

@@ -20,7 +20,7 @@ from ..base import BaseOperation, OperationMetadata
 from ...utils.metrics import determine_severity
 from ...utils.cell_types import ELEMENT_NODE_COUNT
 from ..operation_registry import registry
-from ._face_tables import ELEMENT_FACES
+from ._face_tables import ELEMENT_FACES, build_face_to_cell_map
 
 
 class NonManifoldFaceDetection(BaseOperation):
@@ -144,34 +144,7 @@ class NonManifoldFaceDetection(BaseOperation):
             Dictionary mapping sorted face tuples to list of (cell_index, face_tuple).
             Faces shared by multiple cells will have multiple entries in the list.
         """
-        face_to_cells: Dict[Tuple[int, ...], List[Tuple[int, Tuple[int, ...]]]] = {}
-        global_cell_idx = 0
-
-        for element_type, connectivity in mesh.volume_cells.items():
-            if element_type not in ELEMENT_FACES:
-                # Skip unknown element types
-                continue
-
-            face_definitions = ELEMENT_FACES[element_type]
-            n_cells = len(connectivity)
-
-            for local_cell_idx in range(n_cells):
-                cell_vertices = connectivity[local_cell_idx]
-
-                for face_def in face_definitions:
-                    # Extract face vertices using the local indices
-                    face_verts = tuple(int(cell_vertices[i]) for i in face_def)
-                    # Create canonical key by sorting vertex indices
-                    face_key = tuple(sorted(face_verts))
-
-                    if face_key not in face_to_cells:
-                        face_to_cells[face_key] = []
-
-                    face_to_cells[face_key].append((global_cell_idx, face_verts))
-
-                global_cell_idx += 1
-
-        return face_to_cells
+        return build_face_to_cell_map(mesh)
 
     def _create_locations(
         self,

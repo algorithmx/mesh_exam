@@ -1,9 +1,9 @@
 # Gaps in 3D Volumetric Mesh Quality Check Code
 
 **Report Date:** 2026-04-10
-**Last Updated:** 2026-04-10
+**Last Updated:** 2026-10-27
 **Component:** mesh_issue_examiner - Volumetric (3D) Mesh Operations
-**Status:** 8 Gaps Closed · 0 Partially Closed · 5 Open
+**Status:** 8 Gaps Closed · 1 Partially Closed · 5 Open
 
 ---
 
@@ -16,10 +16,12 @@ The mesh_issue_examiner framework has foundational support for volumetric (3D) m
 - **5 Adapters** — **4 support volumetric meshes** (PyVista, Meshio, Vedo, PyMeshLab); **1 extracts surface boundary** (Trimesh)
 - NonManifoldFaceDetection **implemented and registered**
 - Winding Consistency **extended to all element types** (tet4, hex8, prism6, pyramid5)
-- **4 linear + 4 quadratic element types** now supported (tet4/10, hex8/20, prism6/15, pyramid5/13)
+- **4 linear + 7 quadratic element types** now supported (tet4/10, hex8/20/27, prism6/15, wedge18, pyramid5/13/14)
+- **Quadratic topology checks enabled** via corner-first face resolution (`_face_tables.py`): non-manifold faces, orientation winding, duplicate/orphaned cells, boundary closure all analyze quadratic cells through their corner nodes
 - **Sliver detection extended** to all 4 linear element types (tet4, hex8, prism6, pyramid5)
 - **4 new topological operations** added: DisconnectedComponentDetection, IsolatedVertexDetection, DuplicateFaceDetection, DuplicateVertexDetection
-- **5 gaps remain open** — duplicate/orphaned cell validation, quality metrics, boundary layers, multi-material, parallelism, reporting granularity
+- **3 new volumetric connectivity operations** added (2026-10-27): DuplicateCellDetection, OrphanedCellDetection, BoundaryClosureCheck
+- **Remaining open** — quality metrics coverage, boundary layers, multi-material, parallelism, reporting granularity; NASTRAN now parses CTETRA/CHEXA/CPENTA (higher-order forms reduced to corners), dedicated Gmsh/CGNS/Exodus readers still delegated to meshio
 
 ---
 
@@ -176,7 +178,7 @@ The `OrientationConsistencyCheck` operation now supports all 4 linear element ty
 **Status:** ✅ **COMPLETED** (2026-04-10)
 
 **What was done:**
-All linear and quadratic element types added to `ELEMENT_NODE_COUNT` and VTK type map:
+All linear and quadratic element types added to `ELEMENT_NODE_COUNT`; complete quadratic types (hex27, wedge18, pyramid14) added 2026-10-27:
 
 | Element Type | Nodes | Status |
 |--------------|-------|--------|
@@ -188,27 +190,28 @@ All linear and quadratic element types added to `ELEMENT_NODE_COUNT` and VTK typ
 | `hex20` | 20 | ✅ Supported |
 | `prism15` | 15 | ✅ Supported |
 | `pyramid13` | 13 | ✅ Supported |
+| `hex27` | 27 | ✅ Supported (VTK TRIQUADRATIC_HEXAHEDRON) |
+| `wedge18` | 18 | ✅ Supported (VTK BIQUADRATIC_QUADRATIC_WEDGE) |
+| `pyramid14` | 14 | ✅ Registered — connectivity-level only (no VTK cell) |
+
+**Corner-first quadratic face resolution (2026-10-27):** `_face_tables.py` now defines `ELEMENT_CORNER_COUNT` and `LINEAR_BASE_TYPE`, and `get_face_definitions()` resolves any quadratic element to its linear base type so face-based ops (non-manifold faces, winding, duplicate cells, orphaned cells, boundary closure) analyze quadratic cells through their corner nodes. Midside nodes are ignored for face identity, which is correct because two conforming cells share corners iff they share midside nodes.
 
 **Element Type Support in Operations:**
 
-| Operation | tet4 | hex8 | prism6 | pyramid5 | tet10 | hex20 | prism15 | pyramid13 |
-|-----------|------|------|--------|----------|-------|-------|---------|-----------|
-| NonManifoldFaceDetection | ✅ | ✅ | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
-| OrientationConsistency | ✅ | ✅ | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
-| GeometricValidity (sliver) | ✅ | ✅ | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
-| VolumeCellQuality | ✅ | ✅ | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
+| Operation | Linear (4) | Quadratic (tet10/hex20/prism15/pyramid13) | Complete quadratic (hex27/wedge18) | pyramid14 |
+|-----------|------------|------------------------------------------|-------------------------------------|-----------|
+| NonManifoldFaceDetection | ✅ | ✅ (corner faces) | ✅ (corner faces) | ✅ (corner faces) |
+| OrientationConsistency | ✅ | ✅ (corner faces) | ✅ (corner faces) | ✅ (corner faces) |
+| DuplicateCellDetection | ✅ | ✅ | ✅ | ✅ |
+| OrphanedCellDetection | ✅ | ✅ | ✅ | ✅ |
+| BoundaryClosureCheck | ✅ | ✅ | ✅ | ✅ |
+| GeometricValidity (sliver) | ✅ | ⚠️ linear detectors only | ⚠️ linear detectors only | ⚠️ skipped (no VTK cell) |
+| VolumeCellQuality | ✅ | ⚠️ VTK returns -1 sentinels | ⚠️ VTK returns -1 sentinels | ⚠️ skipped (no VTK cell) |
 
-**Note:** Quadratic elements (tet10, hex20, prism15, pyramid13) are registered in `cell_types.py` but operations use linear face definitions. Full quadratic support requires additional face tables for higher-order elements.
-
-**Still missing:**
-
-| Element Type | Nodes | Use Case |
-|--------------|-------|----------|
-| `hex27` | 27 | Tri-quadratic hexahedra |
-| `wedge18` | 18 | Tri-quadratic prisms |
-| `pyramid14` | 14 | Tri-quadratic pyramids |
-
-**Effort Estimate for remaining:** Low (0.5-1 day)
+**Known limitations:**
+1. **VTK quality sentinel** — `vtkCellQuality` returns -1 for quadratic cells, so VTK-based 3D quality metrics cannot be computed on quadratic elements (the inverted-cell check filters -1 sentinels to avoid false CRITICAL reports; no linearization fallback is implemented).
+2. **pyramid14 has no VTK cell** — VTK's tri-quadratic pyramid has 19 nodes, not 14. pyramid14 is therefore connectivity-level only; native conversion raises `MeshConversionError`, which all converting operations (cell quality, self-intersection, geometric validity, orientation inverted-check) now catch and skip gracefully.
+3. **hex8 winding convention** — the `ELEMENT_FACES['hex8']` bottom face `(0,1,2,3)` is wound inward relative to the module's stated outward convention (same for the prism6 triangle caps). This makes z-stacked hex grids appear winding-inconsistent (false positive); recalibration is deferred because existing tests encode the current convention.
 
 ---
 
@@ -216,26 +219,28 @@ All linear and quadratic element types added to `ELEMENT_NODE_COUNT` and VTK typ
 
 **Location:** `mesh_issue_examiner/utils/mesh_loader.py`, `mesh_issue_examiner/utils/nas_parser.py`
 
-**Status:** ⚠️ **PARTIALLY COMPLETED** (2026-03-31)
+**Status:** ⚠️ **PARTIALLY COMPLETED** (2026-10-27)
 
 **What was done:**
 - `load_mesh_from_file()` now accepts `extract_volume_cells=True` parameter
 - Uses adapter's `to_canonical()` which handles volumetric mesh extraction
-- NASTRAN parser (`nas_parser.py`) extracts CTETRA volumetric cells with boundary face decomposition
+- NASTRAN parser (`nas_parser.py`) extracts CTETRA, CHEXA, and CPENTA volumetric cells with boundary face decomposition (2026-10-27)
+- CHEXA/CPENTA continuation cards supported in both free-field and short-field formats; the 20-node CHEXA / 15-node CPENTA forms are parsed and reduced to corner connectivity (hex8/prism6 — midside nodes dropped)
 - FORMAT_SUPPORT expanded to include .msh, .cgns, .exo, .xdmf, .med, .su2, .ugrid, .inp, and many more
 - `save_mesh_to_file()` with volumetric-aware library selection (prefers meshio)
+- New `nas_mixed_volume` fixture (CTETRA + 20-node CHEXA + CPENTA) with pinned e2e contract and unit tests (`test_nas_parser.py`)
 
 **Current workflow now works:**
 ```python
 # Automatic volumetric extraction
 mesh = load_mesh_from_file("simulation.vtu")  # Returns MeshInput with volume_cells
-mesh = load_mesh_from_file("model.nas")       # CTETRA cells extracted automatically
+mesh = load_mesh_from_file("model.nas")       # CTETRA/CHEXA/CPENTA extracted
 ```
 
 **Remaining gaps:**
 - No dedicated Gmsh reader (relies on meshio delegation)
 - No dedicated CGNS/Exodus readers (relies on meshio)
-- CHEXA/CPENTA entries in NASTRAN not yet parsed (only CTETRA)
+- Higher-order NASTRAN forms (CHEXA20/CPENTA15) are reduced to corner connectivity rather than kept as hex20/prism15 (midside nodes dropped)
 
 **Effort Estimate for remaining:** Medium (2-3 days)
 
@@ -256,12 +261,12 @@ Basic connectivity validation has been addressed through new topological operati
 
 | Check | Description | Impact | Status |
 |-------|-------------|--------|--------|
-| **Duplicate Cells** | Cells with identical vertex lists | Wasted memory, solver confusion | ❌ Not implemented |
-| **Orphaned Cells** | Cells referencing vertex indices ≥ n_vertices | Segmentation fault risk | ❌ Not implemented |
-| **Dangling Faces** | Boundary faces with incorrect adjacency | Open volume, solver failure | ❌ Not implemented |
+| **Duplicate Cells** | Cells with identical vertex lists | Wasted memory, solver confusion | ✅ Implemented (`topology_3d.detect_duplicate_cells`) |
+| **Orphaned Cells** | Cells referencing vertex indices ≥ n_vertices | Segmentation fault risk | ✅ Implemented (`topology_3d.detect_orphaned_cells`) |
+| **Dangling Faces** | Boundary faces with incorrect adjacency | Open volume, solver failure | ✅ Covered by boundary closure check |
 | **Negative Volume** | Cells with inverted orientation | Negative Jacobians | ✅ Covered by orientation check |
 | **Zero Volume** | Degenerate/collapsed cells | Solver singularities | ✅ Covered by geometric validity |
-| **Face Mismatch** | Shared faces with different vertex count | Topology corruption | ❌ Not implemented |
+| **Face Mismatch** | Shared faces with different vertex count | Topology corruption | ✅ Covered by boundary closure (non-conforming interfaces) |
 | **Disconnected Components** | Separate connected regions | May be intentional | ✅ Implemented |
 | **Isolated Vertices** | Vertices not referenced by any face | Wasted memory | ✅ Implemented |
 | **Duplicate Faces** | Faces with identical vertex sets | Rendering artifacts | ✅ Implemented |
@@ -273,14 +278,12 @@ Basic connectivity validation has been addressed through new topological operati
 - `DisconnectedComponentDetection` identifies disconnected regions
 - `IsolatedVertexDetection` finds unreferenced vertices
 - `DuplicateFaceDetection` finds duplicate faces
-- `DuplicateVertexDetection` finds duplicate vertices (with configurable tolerance)
+- `DuplicateVertexDetection` finds duplicate vertices (with configurable tolerance; numpy fallback for meshes with no native representation)
+- `DuplicateCellDetection` finds cells with identical vertex sets — `topology_3d.detect_duplicate_cells` (added 2026-10-27)
+- `OrphanedCellDetection` finds cells referencing out-of-range vertex indices — `topology_3d.detect_orphaned_cells` (added 2026-10-27)
+- `BoundaryClosureCheck` verifies watertightness (every boundary edge shared by exactly two boundary faces) — `topology_3d.check_boundary_closure` (added 2026-10-27)
 
-**Remaining Gaps:**
-1. Duplicate cell detection (cells with identical vertex lists)
-2. Orphaned cell detection (cells referencing invalid vertex indices)
-3. Boundary closure validation (watertight volume checking)
-
-**Effort Estimate:** Low-Medium (1-2 days) for remaining gaps
+**Remaining Gaps:** None. All three remaining items (duplicate cells, orphaned cells, boundary closure) were implemented in Phase 2, with defective fixtures (`duplicate_cell`, `leaky_volume`) and pinned e2e contracts covering each.
 
 ---
 
@@ -469,10 +472,10 @@ Current tests in `test_three_new_operations.py` cover:
 
 | Test | Priority | Description |
 |------|----------|-------------|
-| Higher-order elements | Medium | tet10, hex20 quality checks |
+| ~~Higher-order elements~~ | Medium | ✅ Covered by `test_higher_order_elements.py` (registration, corner face tables, ops on quadratic meshes, pyramid14 degradation) and tet10 e2e fixture |
 | Large mesh performance | Medium | >1M cell mesh handling |
 | All quality metrics | Medium | Each metric type validation |
-| File loading | High | .vtu, .msh format loading |
+| File loading | High | .vtu, .msh format loading (`.vtu` covered by volume fixtures; `.nas` e2e pending CHEXA/CPENTA) |
 | Duplicate vertex detection | Medium | Tests for DuplicateVertexDetection operation |
 
 ---
@@ -487,12 +490,13 @@ Current tests in `test_three_new_operations.py` cover:
 | hex8 | ✅ | ✅ | Full support in all operations |
 | prism6 | ✅ | ✅ | Full support in all operations |
 | pyramid5 | ✅ | ✅ | Full support in all operations |
-| tet10 | ✅ | ⚠️ | Registered but uses linear face tables |
-| hex20 | ✅ | ⚠️ | Registered but uses linear face tables |
-| prism15 | ✅ | ⚠️ | Registered but uses linear face tables |
-| pyramid13 | ✅ | ⚠️ | Registered but uses linear face tables |
-| hex27 | ❌ | ⚠️ | Not yet registered |
-| wedge18 | ❌ | ⚠️ | Not yet registered |
+| tet10 | ✅ | ✅ | Topology ops via corner-first face resolution; VTK quality sentinel-limited |
+| hex20 | ✅ | ✅ | Topology ops via corner-first face resolution; VTK quality sentinel-limited |
+| prism15 | ✅ | ✅ | Topology ops via corner-first face resolution; VTK quality sentinel-limited |
+| pyramid13 | ✅ | ✅ | Topology ops via corner-first face resolution; VTK quality sentinel-limited |
+| hex27 | ✅ | ✅ | Registered (2026-10-27); topology via corners; VTK quality sentinel-limited |
+| wedge18 | ✅ | ✅ | Registered (2026-10-27); topology via corners; VTK quality sentinel-limited |
+| pyramid14 | ✅ | ⚠️ | Registered (2026-10-27) — connectivity-level only (no VTK 14-node pyramid cell) |
 
 ### Quality Metrics
 
@@ -519,6 +523,9 @@ Current tests in `test_three_new_operations.py` cover:
 | IsolatedVertexDetection | ✅ | ✅ | ✅ Implemented |
 | DisconnectedComponentDetection | ✅ | ✅ | ✅ Implemented |
 | OrientationConsistencyCheck | N/A | ✅ | ✅ Implemented |
+| DuplicateCellDetection | N/A | ✅ | ✅ Implemented (2026-10-27) |
+| OrphanedCellDetection | N/A | ✅ | ✅ Implemented (2026-10-27) |
+| BoundaryClosureCheck | N/A | ✅ | ✅ Implemented (2026-10-27) |
 
 ### File Formats
 
@@ -526,7 +533,7 @@ Current tests in `test_three_new_operations.py` cover:
 |--------|------|-------|--------------|-------|
 | .vtu | ✅ (via adapter) | ✅ (meshio) | ✅ | Full support via PyVista/Meshio |
 | .vtk | ✅ (via adapter) | ✅ (meshio) | ✅ | Full support via PyVista/Meshio |
-| .nas/.bdf | ✅ (custom parser) | ❌ | ✅ (CTETRA) | NASTRAN parser extracts CTETRA cells |
+| .nas/.bdf | ✅ (custom parser) | ❌ | ✅ (CTETRA/CHEXA/CPENTA) | NASTRAN parser extracts all three volume cards; higher-order forms reduced to corner connectivity |
 | .msh | ✅ (meshio) | ✅ (meshio) | ✅ | Gmsh format via meshio |
 | .cgns | ✅ (meshio) | ❌ | ✅ | CGNS format via meshio |
 | .exo | ✅ (meshio) | ❌ | ✅ | Exodus format via meshio |
@@ -539,4 +546,4 @@ Current tests in `test_three_new_operations.py` cover:
 ---
 
 *Report generated by code analysis of mesh_issue_examiner framework*
-*Last updated: 2026-04-10 — progress audit against current codebase*
+*Last updated: 2026-10-27 — progress audit against current codebase*

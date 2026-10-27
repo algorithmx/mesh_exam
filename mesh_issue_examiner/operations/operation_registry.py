@@ -193,6 +193,11 @@ class OperationRegistry:
             for operation in operations:
                 issues = operation.run(mesh, config=config)
                 result.issues.extend(issues)
+                # Surface quality metric distributions computed by the
+                # operation (empty for non-quality operations).
+                last_metrics = getattr(operation, 'last_quality_metrics', None)
+                if last_metrics:
+                    result.quality_metrics.extend(last_metrics)
 
             result.processing_time = time.perf_counter() - start_time
 

@@ -2,6 +2,7 @@ __pycache__/
 */__pycache__/
 */*/__pycache__/
 */*/*/__pycache__/
+.venv/
 .pytest_cache/
 */.pytest_cache/
 .claude/
