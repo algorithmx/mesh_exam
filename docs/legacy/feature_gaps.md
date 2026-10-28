@@ -272,7 +272,7 @@ duplicate *faces*, not duplicate *vertices*. This is now detected by the
 | **Flipped normals / orientation** | **High** | **Breaks rendering, simulation, slicing** | **oriented: 89.7% True (10.3% defective)** | **✅ RESOLVED** |
 | **Boundary edges (open meshes)** | **High** | **Can't detect open vs closed meshes** | **closed: 88.6% True (1135 open meshes untestable)** | **✅ RESOLVED** |
 | **Self-intersection FP on open meshes** | **Critical** | **50 false issues on a single open mesh** | **Fixed: 0% FP rate on sample meshes** | **✅ RESOLVED** |
-| Quality metrics not returned | Medium | Metrics endpoint empty for surface meshes | metric_count=0 on all sampled surface meshes | Open |
+| ~~Quality metrics not returned~~ | Medium | ~~Metrics endpoint empty for surface meshes~~ | ✅ Surfaced and pinned by tests (see below) | ✅ RESOLVED |
 | Disconnected components | Medium | May be intentional (assembly); should at least be reported | — | ✅ RESOLVED |
 | Isolated vertices | Low | Cosmetic; wastes memory | — | ✅ RESOLVED |
 | Duplicate faces | Low | Usually harmless but indicates data quality issues | — | ✅ RESOLVED |
@@ -323,5 +323,14 @@ duplicate *faces*, not duplicate *vertices*. This is now detected by the
 
 **False Positive Rate**: 0% (down from ~100% on some open meshes)
 
-The remaining top priorities are:
-1. **Fix quality metrics endpoint** for surface meshes
+### Resolved: Quality Metrics Endpoint for Surface Meshes
+
+**Operation ID**: `quality.compute_cell_quality` surfaced through `mesh_get_quality_metrics`
+
+**Fix Date**: 2026-10-28
+
+**Problem**: `mesh_get_quality_metrics` returned `metric_count=0` for surface-only meshes even though `quality.compute_cell_quality` ran and produced issues — metrics were computed but never surfaced by the endpoint.
+
+**Resolution**: the metrics endpoint now returns surface-mesh metrics (statistics, thresholds, violation counts) alongside volumetric ones. Coverage is pinned by `tests/test_quality_metric_surfacing.py` (`test_surface_quality_metrics_in_result`, `test_get_quality_metrics_returns_live_data`, plus MCP-level volumetric surfacing).
+
+No remaining priorities from the Thingi10K cross-validation: every gap catalogued in this document is resolved.

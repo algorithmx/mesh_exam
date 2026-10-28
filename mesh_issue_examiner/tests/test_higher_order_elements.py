@@ -46,6 +46,12 @@ from mesh_issue_examiner.operations.volumetric.orientation_consistency import (
 from mesh_issue_examiner.operations.volumetric.volume_cell_quality import (
     VolumeCellQualityComputation,
 )
+from mesh_issue_examiner.operations.volumetric.geometric_validity import (
+    GeometricValidityAssessment,
+)
+from mesh_issue_examiner.operations.volumetric._face_tables import (
+    linearized_volume_cells,
+)
 
 
 # ==================================================================
@@ -272,10 +278,87 @@ class TestPyramid14Degradation:
         assert OrphanedCellDetection().execute(mesh) == []
         assert DuplicateCellDetection().execute(mesh) == []
 
-    def test_orientation_winding_check_skips_native_for_pyramid14(self):
+    def test_orientation_single_pyramid14_silent(self):
         issues = OrientationConsistencyCheck().execute(_pyramid14_mesh())
         assert isinstance(issues, list)
-        assert issues == []   # single cell: no shared faces, no inversion data
+        assert issues == []   # single cell: no shared faces, no inversion
+
+
+# ==================================================================
+# pyramid14 native corner fallback: get_native('pyvista') builds a
+# pyramid5-corner grid instead of raising, so strictly native checks
+# (self-intersection, geometric validity) are no longer skipped
+# ==================================================================
+
+class TestPyramid14NativeCornerFallback:
+    def test_native_grid_uses_pyramid5_corners(self):
+        import pyvista as pv
+
+        grid = _pyramid14_mesh().get_native('pyvista')
+        assert isinstance(grid, pv.UnstructuredGrid)
+        assert grid.n_cells == 1
+        assert int(grid.celltypes[0]) == int(pv.CellType.PYRAMID)
+        assert list(grid.get_cell(0).point_ids) == [0, 1, 2, 3, 4]
+        assert grid.user_dict.get('corner_reduced_types') == {
+            'pyramid14': 'pyramid5',
+        }
+
+    def test_native_grid_computes_real_volumes(self):
+        """Native consumers get usable geometry, not a skip."""
+        from mesh_issue_examiner.adapters.factory import get_adapter
+
+        grid = _pyramid14_mesh().get_native('pyvista')
+        volumes = get_adapter('pyvista').compute_cell_quality(grid, 'volume')
+        assert len(volumes) == 1
+        assert volumes[0] > 0    # unit-base pyramid: 1/3
+
+    def test_native_cache_returns_same_object(self):
+        mesh = _pyramid14_mesh()
+        assert mesh.get_native('pyvista') is mesh.get_native('pyvista')
+
+    def test_genuinely_unknown_type_still_raises(self):
+        from mesh_issue_examiner.adapters.exceptions import MeshConversionError
+        import pytest
+
+        mesh = MeshInput(
+            vertices=np.zeros((9, 3)),
+            faces=np.zeros((0, 3), dtype=int),
+            mesh_id="unknown_cell",
+            volume_cells={"weird9": np.array([list(range(9))])},
+        )
+        with pytest.raises(MeshConversionError):
+            mesh.get_native('pyvista')
+
+    def test_linear_mesh_native_unaffected(self):
+        import pyvista as pv
+
+        mesh = MeshInput(
+            vertices=np.array([
+                [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+                [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1],
+            ], float),
+            faces=np.zeros((0, 3), dtype=int),
+            mesh_id="single_hex8",
+            volume_cells={"hex8": np.array([[0, 1, 2, 3, 4, 5, 6, 7]])},
+        )
+        grid = mesh.get_native('pyvista')
+        assert int(grid.celltypes[0]) == int(pv.CellType.HEXAHEDRON)
+        assert not grid.user_dict.get('corner_reduced_types')
+
+    def test_self_intersection_op_executes_on_pyramid14(self):
+        """from_canonical no longer raises, so the native-based op runs
+        its normal path on pyramid14 volumes (boundary extracted from the
+        corner grid; clean pyramid stays silent)."""
+        from mesh_issue_examiner.operations.topological.self_intersection import (
+            SelfIntersectionDetection,
+        )
+
+        mesh = _pyramid14_mesh()
+        mesh.faces = np.array([
+            [0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4],
+        ])
+        issues = SelfIntersectionDetection().execute(mesh)
+        assert isinstance(issues, list)
 
 
 # ==================================================================
@@ -369,3 +452,149 @@ class TestLinearizedQuality:
         assert "scaled_jacobian" in by_name
         assert all("linearized" not in qm.metadata
                    for qm in by_name.values())
+
+
+# ==================================================================
+# Quadratic sliver detection (geometric validity visits quadratic
+# blocks through the corner-linearised grid, with pyramid14 covered
+# via its pyramid5 corners)
+# ==================================================================
+
+def _tet10_sliver_conn():
+    """Corner indices of a squashed tet: volume/max_edge^3 ~ 4e-8.
+
+    Long x-axis needle: a=(0,0,0), b=(10,0,0), c=(5,0.005,0),
+    d=(5,0.0025,0.005).  V = 4.17e-5, max edge 10 -> ratio 4.2e-8,
+    comfortably below the 1e-6 sliver threshold while staying far
+    above the 1e-12 degenerate tolerance.
+    """
+    return np.array([[0, 1, 2, 3]])
+
+
+def _sliver_vertices():
+    return np.array([
+        [0, 0, 0], [10, 0, 0], [5, 0.005, 0], [5, 0.0025, 0.005],
+    ], float)
+
+
+def _tet10_sliver_mesh():
+    """Single tet10 sliver with midside nodes at straight midpoints."""
+    v = _sliver_vertices()
+    mids = [(0, 1), (1, 2), (2, 0), (0, 3), (1, 3), (2, 3)]
+    vertices = np.vstack([v, [(v[i] + v[j]) / 2 for i, j in mids]])
+    conn = np.array([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
+    return MeshInput(
+        vertices=vertices,
+        faces=np.zeros((0, 3), dtype=int),
+        mesh_id="tet10_sliver",
+        volume_cells={"tet10": conn},
+    )
+
+
+def _pyramid14_sliver_mesh():
+    """Single squashed pyramid14: 10x10 base, apex 1e-5 above centre.
+
+    V = 100*1e-5/3 ~ 3.3e-4, max edge sqrt(200) ~ 14.14 -> ratio ~1.2e-7.
+    """
+    corners = np.array([
+        [0, 0, 0], [10, 0, 0], [10, 10, 0], [0, 10, 0], [5, 5, 1e-5],
+    ], float)
+    mids = [(0, 1), (1, 2), (2, 3), (3, 0),
+            (0, 4), (1, 4), (2, 4), (3, 4)]
+    vertices = np.vstack(
+        [corners, [(corners[i] + corners[j]) / 2 for i, j in mids],
+         [corners[:4].mean(axis=0)]])
+    return MeshInput(
+        vertices=vertices,
+        faces=np.zeros((0, 3), dtype=int),
+        mesh_id="pyramid14_sliver",
+        volume_cells={"pyramid14": np.array([list(range(14))])},
+    )
+
+
+class TestLinearizedVolumeCellsHelper:
+    def test_same_base_blocks_concatenate_in_order(self):
+        """tet4 + tet10 merge into one tet4 block, original order kept."""
+        mesh = MeshInput(
+            vertices=np.zeros((14, 3)),
+            faces=np.zeros((0, 3), dtype=int),
+            mesh_id="mixed_same_base",
+            volume_cells={
+                "tet4": np.array([[0, 1, 2, 3]]),
+                "tet10": np.array([[list(range(4, 14))][0]]),
+            },
+        )
+        lin = linearized_volume_cells(mesh)
+        assert lin is not None
+        assert list(lin) == ["tet4"]
+        assert lin["tet4"].shape == (2, 4)
+        np.testing.assert_array_equal(lin["tet4"][0], [0, 1, 2, 3])
+        np.testing.assert_array_equal(lin["tet4"][1], [4, 5, 6, 7])
+
+    def test_none_for_purely_linear_mesh(self):
+        mesh = MeshInput(
+            vertices=np.zeros((8, 3)),
+            faces=np.zeros((0, 3), dtype=int),
+            mesh_id="hex_only",
+            volume_cells={"hex8": np.zeros((1, 8), int)},
+        )
+        assert linearized_volume_cells(mesh) is None
+
+
+class TestQuadraticSliverDetection:
+    def _sliver_issues(self, mesh):
+        return [
+            i for i in GeometricValidityAssessment().execute(mesh)
+            if "sliver" in i.message
+        ]
+
+    def test_squashed_tet10_fires_sliver(self):
+        issues = self._sliver_issues(_tet10_sliver_mesh())
+        assert len(issues) == 1
+        issue = issues[0]
+        assert issue.metrics["sliver_count"] == 1
+        assert issue.metrics["sliver_tet10_count"] == 1
+        assert issue.metadata.get("linearized") is True
+        assert issue.locations[0].element_index == 0
+
+    def test_clean_tet10_no_slivers(self):
+        assert self._sliver_issues(_two_tet10_mesh()) == []
+
+    def test_mixed_tet4_tet10_indices_and_attribution(self):
+        """tet4 block first, tet10 sliver second: global index 1, and the
+        count is attributed to tet10 (not the tet4 base type)."""
+        sliver = _tet10_sliver_mesh()
+        good_tet_v = np.array([
+            [0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1],
+        ], float)
+        vertices = np.vstack([good_tet_v, sliver.vertices])
+        offset = len(good_tet_v)
+        mesh = MeshInput(
+            vertices=vertices,
+            faces=np.zeros((0, 3), dtype=int),
+            mesh_id="mixed_tet4_tet10_sliver",
+            volume_cells={
+                "tet4": np.array([[0, 1, 2, 3]]),
+                "tet10": sliver.volume_cells["tet10"] + offset,
+            },
+        )
+        issues = self._sliver_issues(mesh)
+        assert len(issues) == 1
+        issue = issues[0]
+        assert issue.metrics["sliver_count"] == 1
+        assert issue.metrics["sliver_tet10_count"] == 1
+        assert "sliver_tet4_count" not in issue.metrics
+        assert issue.locations[0].element_index == 1
+
+    def test_pyramid14_sliver_not_skipped(self):
+        """pyramid14 has no VTK cell but the corner fallback reaches the
+        pyramid5 detector: the squashed pyramid fires with attribution."""
+        issues = self._sliver_issues(_pyramid14_sliver_mesh())
+        assert len(issues) == 1
+        issue = issues[0]
+        assert issue.metrics["sliver_count"] == 1
+        assert issue.metrics["sliver_pyramid14_count"] == 1
+        assert issue.metadata.get("linearized") is True
+
+    def test_clean_pyramid14_no_slivers(self):
+        assert self._sliver_issues(_pyramid14_mesh()) == []

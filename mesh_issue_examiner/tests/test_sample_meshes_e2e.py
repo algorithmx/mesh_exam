@@ -288,6 +288,15 @@ VOLUME_CASES = {
                             "boundary_closure", "nonmanifold_faces",
                             "check_orientation_consistency"],
     },
+    # Single squashed tet10: sliver fires via corner linearisation,
+    # attributed to tet10; connectivity ops stay silent.
+    "quadratic_sliver": {
+        "expect_passed": False,
+        "expect_keywords": ["assess_geometric_validity"],
+        "forbid_keywords": ["duplicate_cells", "orphaned_cells",
+                            "boundary_closure", "nonmanifold_faces",
+                            "check_orientation_consistency"],
+    },
 }
 
 
@@ -416,6 +425,39 @@ class TestVolumeMeshes:
 
 
 # ===================================================================
+# 3c. Quadratic sliver (.vtu): corner-linearised geometric validity
+# ===================================================================
+
+class TestQuadraticSliver:
+    """quadratic_sliver exercises sliver detection on quadratic cells.
+
+    vtkCellQuality cannot evaluate tet10 cells, so geometric validity
+    linearises to the corner tet4 grid; the squashed cell must be
+    reported with sliver_tet10_count attribution.
+    """
+
+    @pytest.mark.asyncio
+    async def test_sliver_fires_with_tet10_attribution(self):
+        server = _server()
+        _, inspect, issues = await _load_inspect_get_issues(
+            server, "quadratic_sliver", fmt="vtu")
+        assert inspect["passed"] is False
+
+        sliver = [
+            i for i in issues["issues"]
+            if "assess_geometric_validity" in i["operation_id"]
+            and "sliver" in i["message"]
+        ]
+        assert sliver, (
+            f"expected a sliver issue, got "
+            f"{[i['operation_id'] for i in issues['issues']]}")
+        metrics = sliver[0]["metrics"]
+        assert metrics["sliver_count"] == 1
+        assert metrics["sliver_tet10_count"] == 1
+        assert sliver[0]["metadata"].get("linearized") is True
+
+
+# ===================================================================
 # 3c. NASTRAN mixed volumetric deck (.nas): CTETRA + CHEXA + CPENTA
 # ===================================================================
 
@@ -481,6 +523,150 @@ class TestNastranMixedVolume:
         assert by_name["volume"]["total_count"] == 3   # tet + hex + wedge
         assert by_name["volume"]["violation_count"] == 0
         assert abs(by_name["volume"]["statistics"]["max"] - 1.0) < 1e-9
+
+
+# ===================================================================
+# 3c-bis. Gmsh 2.2 ASCII mixed volumetric deck (.msh): native reader
+# ===================================================================
+
+class TestGmshMixedVolume:
+    """The gmsh_mixed_volume fixture exercises the native .msh parser.
+
+    A tet10 (Gmsh node order, reordered to canonical VTK order on load)
+    and a hex8 in two physical groups; loaded through the native Gmsh
+    2.2 ASCII parser with physical-group materials.
+    """
+
+    @pytest.mark.asyncio
+    async def test_mixed_element_types_parsed(self):
+        """tet10 (gmsh order) + hex8 parse into canonical volume cells
+        with physical-group materials attached."""
+        import numpy as np
+        from mesh_issue_examiner.utils.mesh_loader import load_mesh_from_file
+
+        mesh = load_mesh_from_file(
+            _mesh_file("gmsh_mixed_volume", fmt="msh"),
+            material_array_name="gmsh:physical",
+        )
+        assert mesh.source_format == "msh"
+        assert mesh.has_volume_cells
+        assert set(mesh.cell_types) == {"tet10", "hex8"}
+        assert mesh.volume_cells["tet10"].shape == (1, 10)
+        assert mesh.volume_cells["hex8"].shape == (1, 8)
+        assert mesh.n_vertices == 18
+        assert mesh.n_volume_cells == 2
+        np.testing.assert_array_equal(mesh.cell_materials, [1, 2])
+        assert mesh.material_names == {1: "fluid", 2: "solid"}
+
+    @pytest.mark.asyncio
+    async def test_tet10_midside_nodes_reordered_to_vtk(self):
+        """Gmsh and VTK disagree on the last two tet10 midside entries;
+        the parser must swap them so canonical position 8 is the (1,3)-
+        edge midpoint and position 9 the (2,3)-edge midpoint."""
+        import numpy as np
+        from mesh_issue_examiner.utils.mesh_loader import load_mesh_from_file
+
+        mesh = load_mesh_from_file(
+            _mesh_file("gmsh_mixed_volume", fmt="msh"))
+        conn = mesh.volume_cells["tet10"][0]
+        np.testing.assert_allclose(mesh.vertices[conn[8]], [0.5, 0.0, 0.5])
+        np.testing.assert_allclose(mesh.vertices[conn[9]], [0.0, 0.5, 0.5])
+
+    @pytest.mark.asyncio
+    async def test_pipeline_runs_and_connectivity_ops_silent(self):
+        """Full MCP pipeline on the .msh deck: two disjoint bodies are
+        detected as disconnected, but no connectivity defects fire."""
+        server = _server()
+        load, inspect, issues = await _load_inspect_get_issues(
+            server, "gmsh_mixed_volume", fmt="msh")
+        assert load["format"] == "msh"
+        assert load["n_vertices"] == 18
+        assert inspect["passed"] is False
+
+        op_ids = {i["operation_id"] for i in issues["issues"]}
+        assert any("disconnected" in oid for oid in op_ids), op_ids
+        for kw in ("duplicate_cells", "orphaned_cells", "boundary_closure",
+                   "nonmanifold_faces", "check_orientation_consistency"):
+            assert not any(kw in oid for oid in op_ids), (
+                f"gmsh_mixed_volume: unexpected '{kw}' in operation IDs: {op_ids}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_mcp_load_with_materials_reports_groups(self):
+        """mesh_load with material_array_name surfaces the physical
+        groups as the materials summary block."""
+        server = _server()
+        resp = await server.handle_request(MCPRequest(
+            method="mesh_load",
+            params={
+                "file_path": _mesh_file("gmsh_mixed_volume", fmt="msh"),
+                "material_array_name": "gmsh:physical",
+            },
+        ))
+        assert resp.error is None, f"load failed: {resp.error}"
+        mats = resp.result["materials"]
+        assert mats["count"] == 2
+        assert mats["ids"] == [1, 2]
+        assert mats["n_cells_assigned"] == 2
+
+
+# ===================================================================
+# 3c-ter. Optional I/O formats (CGNS / Exodus): verified delegation
+# ===================================================================
+
+class TestOptionalIOFormats:
+    """cgns_volume / exo_volume exercise meshio's format delegation.
+
+    The fixtures (the clean 2x2x2 hex volume) are only written — and
+    these tests only run — when the delegate dependency is installed:
+    h5py for CGNS, netCDF4 for Exodus.  Without the dependency the
+    loader reports a clean MeshLoadError (covered by the gmsh garbage
+    test path).
+    """
+
+    @pytest.mark.asyncio
+    async def test_cgns_volume_loads_and_passes(self):
+        pytest.importorskip("h5py")
+        server = _server()
+        load, inspect, issues = await _load_inspect_get_issues(
+            server, "cgns_volume", fmt="cgns")
+        assert load["format"] == "cgns"
+        # meshio's CGNS support is tetra-only; the fixture is the
+        # two-unit-tet mesh (5 vertices, 2 cells) and it is fully clean.
+        assert load["n_vertices"] == 5
+        assert inspect["passed"] is True
+        assert issues["total_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_cgns_volume_cells_populated(self):
+        pytest.importorskip("h5py")
+        from mesh_issue_examiner.utils.mesh_loader import load_mesh_from_file
+
+        mesh = load_mesh_from_file(_mesh_file("cgns_volume", fmt="cgns"))
+        assert mesh.has_volume_cells
+        assert set(mesh.cell_types) == {"tet4"}
+        assert mesh.volume_cells["tet4"].shape == (2, 4)
+
+    @pytest.mark.asyncio
+    async def test_exo_volume_loads_and_passes(self):
+        pytest.importorskip("netCDF4")
+        server = _server()
+        load, inspect, issues = await _load_inspect_get_issues(
+            server, "exo_volume", fmt="exo")
+        assert load["format"] == "exo"
+        assert load["n_vertices"] == 27
+        assert inspect["passed"] is True
+        assert issues["total_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_exo_volume_cells_populated(self):
+        pytest.importorskip("netCDF4")
+        from mesh_issue_examiner.utils.mesh_loader import load_mesh_from_file
+
+        mesh = load_mesh_from_file(_mesh_file("exo_volume", fmt="exo"))
+        assert mesh.has_volume_cells
+        assert "hex8" in mesh.cell_types
+        assert mesh.volume_cells["hex8"].shape == (8, 8)
 
 
 # ===================================================================

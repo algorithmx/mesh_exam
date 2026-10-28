@@ -176,6 +176,107 @@ def parse_nas(file_path: str) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndar
 
 
 # ---------------------------------------------------------------------------
+# Write-back (free-field bulk data)
+# ---------------------------------------------------------------------------
+
+# Canonical element types write_nas can emit: NASTRAN card keyword and
+# the node count of the card form (the quadratic CHEXA/CPENTA forms
+# keep midside nodes; only these types round-trip through parse_nas).
+_NAS_WRITABLE = {
+    'tet4': ('CTETRA', 4),
+    'hex8': ('CHEXA', 8),
+    'hex20': ('CHEXA', 20),
+    'prism6': ('CPENTA', 6),
+    'prism15': ('CPENTA', 15),
+}
+
+
+def write_nas(vertices, faces, volume_cells, path) -> None:
+    """Write canonical mesh arrays to a NASTRAN free-field bulk-data file.
+
+    Vertices become GRID cards numbered 1..N (so all vertices must be
+    referenced by at least one element to survive a re-parse).
+    Volume cells are written as CTETRA/CHEXA/CPENTA cards — the 8/20-node
+    CHEXA and 6/15-node CPENTA forms retain midside nodes, whose
+    NASTRAN ordering matches the canonical (VTK) ordering, so the
+    connectivity maps directly.  A mesh with no volume cells has its
+    triangular ``faces`` written as CTRIA3 surface cards; with volume
+    cells the boundary surface is implied by the cells (and re-derived
+    on parse), so faces are not written explicitly — writing both would
+    double-count every boundary face on re-parse.
+
+    Args:
+        vertices: (N, 3) vertex coordinates.
+        faces: (M, 3) triangular faces (used for surface-only meshes).
+        volume_cells: dict of element type -> (n, k) 0-based
+            connectivity.  Types without a NASTRAN card form raise
+            ValueError instead of losing nodes silently.
+        path: output file path.
+    """
+    vertices = np.asarray(vertices, dtype=np.float64)
+
+    lines = ["$ Written by mesh_issue_examiner.utils.nas_parser.write_nas",
+             "BEGIN BULK"]
+
+    for i, (x, y, z) in enumerate(vertices, start=1):
+        # repr() of a Python float is the shortest string that parses
+        # back to the exact same value, keeping round-trips lossless.
+        # (float() first: repr of np.float64 renders as np.float64(0.0),
+        # which would not parse back.)
+        lines.append(f"GRID,{i},0,{float(x)!r},{float(y)!r},{float(z)!r}")
+
+    eid = 100
+    volume_cells = volume_cells or {}
+    if volume_cells:
+        for etype, cells in volume_cells.items():
+            spec = _NAS_WRITABLE.get(etype)
+            if spec is None:
+                raise ValueError(
+                    f"Element type {etype!r} has no NASTRAN card form "
+                    f"supported by write_nas; writable types: "
+                    f"{sorted(_NAS_WRITABLE)}")
+            keyword, width = spec
+            head = 8 if keyword == 'CHEXA' else (6 if keyword == 'CPENTA'
+                                                 else width)
+            for row in np.asarray(cells):
+                nodes = [str(int(n) + 1) for n in row[:width]]
+                eid += 1
+                if keyword == 'CTETRA':
+                    lines.append(
+                        f"CTETRA,{eid},1," + ",".join(nodes))
+                    continue
+                parent = nodes[:head]
+                remaining = nodes[head:]
+                if not remaining:
+                    lines.append(
+                        f"{keyword},{eid},1," + ",".join(parent))
+                    continue
+                # Continuation cards: +C<eid>1, +C<eid>2, ... with up to
+                # eight node fields each (the parser skips the leading
+                # marker field of every '+' line).
+                chunks = [remaining[i:i + 8]
+                          for i in range(0, len(remaining), 8)]
+                lines.append(",".join(
+                    [keyword, str(eid), "1"] + parent
+                    + [f"+C{eid}1"]))
+                for k, chunk in enumerate(chunks, start=1):
+                    cont = [f"+C{eid}{k}"] + chunk
+                    if k < len(chunks):
+                        cont.append(f"+C{eid}{k + 1}")
+                    lines.append(",".join(cont))
+    else:
+        faces = np.asarray(faces, dtype=np.int64)
+        for row in faces:
+            eid += 1
+            nodes = ",".join(str(int(n) + 1) for n in row)
+            lines.append(f"CTRIA3,{eid},1,{nodes}")
+
+    lines.append("ENDDATA")
+    with open(path, 'w') as f:
+        f.write("\n".join(lines) + "\n")
+
+
+# ---------------------------------------------------------------------------
 # Field parsers
 # ---------------------------------------------------------------------------
 

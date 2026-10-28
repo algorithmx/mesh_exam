@@ -201,28 +201,54 @@ class PyVistaAdapter(MeshAdapter):
         if mesh_input.has_volume_cells:
             try:
                 cell_type_map = get_cell_type_map()
+                # Element types with no VTK cell (pyramid14) fall back to
+                # their linear base element built from the leading corner
+                # nodes (VTK ordering places corners first), so strictly
+                # native checks are no longer skipped for such meshes.
+                # Provenance is recorded on the grid's user_dict.
+                from ..operations.volumetric._face_tables import (
+                    ELEMENT_CORNER_COUNT, LINEAR_BASE_TYPE,
+                )
+                corner_reduced: Dict[str, str] = {}
                 all_cells = []
                 all_celltypes = []
                 
                 for etype, connectivity in mesh_input.volume_cells.items():
                     vtk_type = cell_type_map.get(etype)
+                    n_corner = None
                     if vtk_type is None:
-                        raise MeshConversionError(
-                            f"Unknown element type '{etype}'. "
-                            f"Supported: {list(cell_type_map.keys())}"
-                        )
+                        base = LINEAR_BASE_TYPE.get(etype)
+                        n_corner = (ELEMENT_CORNER_COUNT.get(base)
+                                    if base else None)
+                        vtk_type = cell_type_map.get(base) if base else None
+                        if vtk_type is None or n_corner is None:
+                            raise MeshConversionError(
+                                f"Unknown element type '{etype}'. "
+                                f"Supported: {list(cell_type_map.keys())}"
+                            )
+                        corner_reduced[etype] = base
                     
                     for row in connectivity:
-                        all_cells.append(len(row))
-                        all_cells.extend(row.tolist())
+                        nodes = (row[:n_corner] if n_corner is not None
+                                 else row)
+                        all_cells.append(len(nodes))
+                        all_cells.extend(nodes.tolist())
                         all_celltypes.append(vtk_type)
                 
                 cells_arr = np.array(all_cells, dtype=np.int64)
                 celltypes_arr = np.array(all_celltypes, dtype=np.uint8)
                 
-                return pv.UnstructuredGrid(
+                grid = pv.UnstructuredGrid(
                     cells_arr, celltypes_arr, mesh_input.vertices
                 )
+                if corner_reduced:
+                    try:
+                        grid.user_dict['corner_reduced_types'] = corner_reduced
+                    except Exception:
+                        # Provenance is best-effort; conversion itself
+                        # must not fail because of it.
+                        pass
+                return grid
             except MeshConversionError:
                 raise
             except Exception as e:

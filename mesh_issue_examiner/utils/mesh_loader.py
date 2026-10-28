@@ -2,6 +2,7 @@
 Mesh loading utilities with format support.
 """
 
+import logging
 import os
 from pathlib import Path
 from typing import List, Optional, Union, Dict, Any
@@ -9,6 +10,8 @@ import numpy as np
 
 from ..core.models import MeshInput
 from ..core.exceptions import MeshLoadError, UnsupportedFormatError
+
+logger = logging.getLogger(__name__)
 
 
 def _validate_mesh_arrays(vertices: np.ndarray, faces: np.ndarray) -> None:
@@ -211,6 +214,36 @@ def load_mesh_from_file(
 
         return mesh_input
 
+    # Gmsh .msh: try the native 2.2 ASCII parser first (physical groups
+    # become cell_materials/material_names); fall back to meshio for the
+    # variants the native parser declines (binary, 4.x).
+    if suffix == '.msh':
+        try:
+            from .gmsh_parser import parse_msh
+            vertices, faces, volume_cells, cell_mats, mat_names = parse_msh(
+                str(file_path))
+        except ValueError as e:
+            logger.info(
+                "Native Gmsh parser declined %s (%s); falling back to "
+                "meshio", file_path, e)
+        else:
+            _validate_mesh_arrays(vertices, faces)
+            mesh_input = MeshInput(
+                vertices=vertices,
+                faces=faces,
+                mesh_id=mesh_id or file_path.stem,
+                source_format='msh',
+                file_path=str(file_path),
+                volume_cells=volume_cells if volume_cells else None,
+            )
+            # Physical-group tags are the native material mechanism for
+            # .msh files; attach them when any material array is requested.
+            if material_array_name and cell_mats is not None:
+                mesh_input.cell_materials = cell_mats
+                if mat_names:
+                    mesh_input.material_names = mat_names
+            return mesh_input
+
     # Determine library to use
     available_libraries = FORMAT_SUPPORT[suffix]
 
@@ -282,6 +315,13 @@ def load_mesh_from_file(
         raise MeshLoadError(
             f"Failed to import {selected_library}: {str(e)}"
         ) from e
+    except SystemExit as e:
+        # Some libraries (meshio's read helper) sys.exit() on unreadable
+        # files instead of raising; translate into the loader's contract.
+        raise MeshLoadError(
+            f"Failed to load mesh from {file_path}: library exited "
+            f"with status {e.code}"
+        ) from e
     except Exception as e:
         raise MeshLoadError(
             f"Failed to load mesh from {file_path}: {str(e)}"
@@ -339,6 +379,18 @@ def save_mesh_to_file(
     """
     file_path = Path(file_path)
     suffix = file_path.suffix.lower()
+
+    # NASTRAN write-back: emit a free-field bulk-data deck natively so
+    # the quadratic CHEXA/CPENTA forms keep their midside nodes.
+    if suffix in ('.nas', '.bdf'):
+        from .nas_parser import write_nas
+        write_nas(
+            mesh.vertices,
+            mesh.faces,
+            mesh.volume_cells if mesh.has_volume_cells else {},
+            str(file_path),
+        )
+        return
 
     if library is None:
         if suffix not in FORMAT_SUPPORT:

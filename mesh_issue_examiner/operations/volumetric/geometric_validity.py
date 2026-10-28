@@ -25,6 +25,7 @@ from ..base import BaseOperation, OperationMetadata
 from ..operation_registry import registry
 from ...adapters.factory import get_adapter
 from ...adapters.exceptions import MeshConversionError
+from ._face_tables import linearized_volume_cells
 
 
 class GeometricValidityAssessment(BaseOperation):
@@ -80,18 +81,47 @@ class GeometricValidityAssessment(BaseOperation):
         if not mesh.has_volume_cells:
             return issues
 
-        # 2. Get the PyVista UnstructuredGrid.  Meshes containing element
-        #    types with no VTK equivalent (e.g. pyramid14) cannot be
-        #    converted; geometric validity requires native volume
-        #    computation, so the check is skipped entirely.
+        # 2. Corner-linearised cell table: quadratic element types keep
+        #    their corner connectivity (VTK node ordering places corners
+        #    first), re-keyed by linear base type.  vtkCellQuality cannot
+        #    evaluate quadratic cells (it returns -1 for them), so volumes
+        #    are computed on the linearised grid whenever quadratic types
+        #    are present.  This also unblocks pyramid14 (no VTK cell),
+        #    whose pyramid5 corners carry the geometry.
+        linearized_cells = linearized_volume_cells(mesh)
+
+        grid = None
         try:
             grid = mesh.get_native('pyvista')
         except MeshConversionError as exc:
-            logger.warning(
-                'Skipping geometric validity check (no VTK equivalent for '
-                'some element types): %s', exc,
-            )
-            return issues
+            if linearized_cells is None:
+                # No VTK equivalent and no corner fallback: the check is
+                # skipped entirely.
+                logger.warning(
+                    'Skipping geometric validity check (no VTK equivalent '
+                    'for some element types): %s', exc,
+                )
+                return issues
+
+        linearized = False
+        if linearized_cells is not None:
+            try:
+                lin_mesh = MeshInput(
+                    vertices=mesh.vertices,
+                    faces=mesh.faces,
+                    mesh_id=f'{mesh.mesh_id}_corner_linearized',
+                    volume_cells=linearized_cells,
+                )
+                grid = lin_mesh.get_native('pyvista')
+                linearized = True
+            except MeshConversionError as exc:
+                if grid is None:
+                    logger.warning(
+                        'Skipping geometric validity check (native and '
+                        'corner-linearised conversion both failed): %s', exc,
+                    )
+                    return issues
+                # Native grid remains usable; keep the original mesh.
 
         # 3. Compute cell volumes via the adapter
         volumes = self._adapter.compute_cell_quality(grid, 'volume')
@@ -126,10 +156,24 @@ class GeometricValidityAssessment(BaseOperation):
 
         # 5. Find sliver cells: volume > degenerate_tol but
         #    volume / (max_edge_length^3) < sliver_threshold
+        #
+        #    Detection runs over the merged (linearised) cell table: when
+        #    quadratic types are present, quadratic rows enter their base
+        #    type's block with corner-only connectivity.  The merged
+        #    enumeration preserves the mesh's global cell numbering, so
+        #    detector offsets and reported indices line up with the
+        #    original mesh, and each index can be attributed back to its
+        #    original element type.
         vertices = mesh.vertices
-        sliver_results: Dict[str, np.ndarray] = {}
+        detector_cells = linearized_cells if linearized else mesh.volume_cells
+        sliver_results: Dict[str, List[int]] = {}
 
-        # Map element types to their detector methods
+        # Original element type per global cell index (insertion order).
+        cell_types: List[str] = []
+        for etype, conn in mesh.volume_cells.items():
+            cell_types.extend([etype] * len(conn))
+
+        # Map base element types to their detector methods
         detector_map = {
             'tet4': self._detect_sliver_tets,
             'hex8': self._detect_sliver_hexes,
@@ -138,34 +182,40 @@ class GeometricValidityAssessment(BaseOperation):
         }
 
         for element_type, detector in detector_map.items():
-            conn = mesh.volume_cells.get(element_type, np.array([]))
+            conn = detector_cells.get(element_type, np.array([]))
             if len(conn) == 0:
                 continue
 
-            offset = self._compute_element_offset(mesh, element_type)
+            offset = self._compute_element_offset(detector_cells, element_type)
             sliver_indices = detector(conn, vertices, volumes, degenerate_mask, offset)
 
-            if len(sliver_indices) > 0:
-                sliver_results[element_type] = sliver_indices
+            for idx in sliver_indices:
+                orig_type = (
+                    cell_types[int(idx)] if int(idx) < len(cell_types)
+                    else element_type
+                )
+                sliver_results.setdefault(orig_type, []).append(int(idx))
 
         if sliver_results:
-            all_sliver_indices = np.concatenate(list(sliver_results.values()))
+            all_sliver_indices = sorted(
+                idx for indices in sliver_results.values() for idx in indices
+            )
             capped_sliver = all_sliver_indices[:100]
             locations = [
                 IssueLocation(element_type='cell', element_index=int(idx))
                 for idx in capped_sliver
             ]
 
-            total_slivers = sum(len(v) for v in sliver_results.values())
+            total_slivers = len(all_sliver_indices)
             metrics: Dict[str, float] = {
                 'sliver_count': float(total_slivers),
                 'sliver_threshold': self.sliver_threshold,
                 'total_cells': float(len(volumes)),
             }
-            for element_type, indices in sliver_results.items():
+            for element_type, indices in sorted(sliver_results.items()):
                 metrics[f'sliver_{element_type}_count'] = float(len(indices))
 
-            issues.append(MeshIssue(
+            issue = MeshIssue(
                 operation_id=self.metadata.operation_id,
                 category=IssueCategory.GEOMETRIC,
                 severity=IssueSeverity.WARNING,
@@ -175,7 +225,13 @@ class GeometricValidityAssessment(BaseOperation):
                 ),
                 locations=locations,
                 metrics=metrics,
-            ))
+            )
+            if linearized:
+                # Slivers were judged on corner-only geometry; midside
+                # curvature is ignored (same provenance tag as the
+                # linearised quality metrics).
+                issue.metadata['linearized'] = True
+            issues.append(issue)
 
         return issues
 
@@ -184,16 +240,16 @@ class GeometricValidityAssessment(BaseOperation):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _compute_element_offset(mesh: MeshInput, element_type: str) -> int:
+    def _compute_element_offset(volume_cells: Dict[str, np.ndarray],
+                                element_type: str) -> int:
         """Return the global cell index where *element_type* cells begin.
 
-        The UnstructuredGrid built by ``MeshInput._construct_pyvista_volumetric``
-        iterates ``volume_cells`` in insertion order, appending each element
-        type sequentially.  The offset is therefore the sum of cell counts
-        for every element type that appears before *element_type* in the dict.
+        Works on the (possibly linearised/merged) cell table the detectors
+        run over: it iterates the dict in insertion order, summing cell
+        counts for every element type that appears before *element_type*.
         """
         offset = 0
-        for etype, conn in mesh.volume_cells.items():
+        for etype, conn in volume_cells.items():
             if etype == element_type:
                 break
             offset += len(conn)

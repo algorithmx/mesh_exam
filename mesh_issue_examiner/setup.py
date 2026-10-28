@@ -42,6 +42,7 @@ setup(
         "trimesh": ["trimesh>=4.0.0"],
         "pyvista": ["pyvista>=0.40.0", "vtk>=9.2.0"],
         "pymeshlab": ["pymeshlab>=2022.2"],
+        "io": ["h5py>=3.8.0", "netCDF4>=1.6.0"],
         "dev": [
             "pytest>=7.0.0",
             "pytest-asyncio>=0.21.0",
@@ -53,6 +54,8 @@ setup(
             "pyvista>=0.40.0",
             "vtk>=9.2.0",
             "pymeshlab>=2022.2",
+            "h5py>=3.8.0",
+            "netCDF4>=1.6.0",
         ],
     },
     entry_points={

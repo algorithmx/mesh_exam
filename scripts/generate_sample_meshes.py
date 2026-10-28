@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -437,6 +438,15 @@ CONTRACTS = {
                      "no_keywords": ["duplicate_cells", "orphaned_cells",
                                      "boundary_closure", "nonmanifold_faces",
                                      "check_orientation_consistency"]},
+    # Single squashed tet10: geometric validity fires the sliver warning
+    # through the corner-linearised grid (attributed sliver_tet10_count);
+    # the linearised quality metrics flag the same cell, so inspection
+    # fails.  Connectivity ops stay silent (closed single cell).
+    "quadratic_sliver": {"passed": False,
+                         "keywords": ["assess_geometric_validity"],
+                         "no_keywords": ["duplicate_cells", "orphaned_cells",
+                                         "boundary_closure", "nonmanifold_faces",
+                                         "check_orientation_consistency"]},
     # NASTRAN mixed deck (CTETRA + CHEXA20 -> hex20 with midside nodes
     # retained + CPENTA6 -> prism6; Phase 5, 2026-10-28).  Three disjoint
     # cells by construction, so the 2D surface ops fire (disconnected
@@ -447,6 +457,18 @@ CONTRACTS = {
                          "no_keywords": ["duplicate_cells", "orphaned_cells",
                                          "boundary_closure", "nonmanifold_faces",
                                          "check_orientation_consistency"]},
+    # Gmsh 2.2 ASCII mixed deck (tet10 in Gmsh node order, reordered to
+    # canonical VTK order on load + hex8; two physical groups feed
+    # cell_materials via material_array_name="gmsh:physical").  Like the
+    # NASTRAN deck the two bodies are disjoint, so the 2D surface ops
+    # fire (disconnected components, corner valence noise) while the
+    # volumetric connectivity ops stay silent.
+    "gmsh_mixed_volume": {"passed": False,
+                           "keywords": ["disconnected"],
+                           "material_array": "gmsh:physical",
+                           "no_keywords": ["duplicate_cells", "orphaned_cells",
+                                           "boundary_closure", "nonmanifold_faces",
+                                           "check_orientation_consistency"]},
     # Two-material hex volume: materials 1/2 split the 2x2x1 grid along x.
     # Loaded with material_array_name="material" so detect_material_interfaces
     # and per_material_statistics fire (INFO-level); connectivity ops silent.
@@ -457,6 +479,14 @@ CONTRACTS = {
                              "no_keywords": ["duplicate_cells", "orphaned_cells",
                                              "boundary_closure",
                                              "nonmanifold_faces"]},
+    # Optional-dep formats, verified delegation to meshio (no native
+    # parser): Exodus takes the clean 2x2x2 hex volume; meshio's CGNS
+    # support is a tetra-only stub, so CGNS gets the two-unit-tet mesh
+    # (tet10_volume's corner geometry as linear tets).  Both stay silent
+    # on the volumetric connectivity ops.  Skipped on machines without
+    # the delegate dependency ("requires").
+    "cgns_volume": {"passed": True, "zero": True, "requires": "h5py"},
+    "exo_volume": {"passed": True, "zero": True, "requires": "netCDF4"},
     # Boundary-layer volumes (prism6 stack + tet4 cap).  The clean stack
     # (growth 1.15) keeps quality_3d.check_boundary_layer silent and,
     # since the winding recalibration (2026-10-28), passes inspection:
@@ -621,6 +651,28 @@ def write_mixed_volume_vtu(path: Path, vertices,
     grid.save(str(path))
 
 
+def quadratic_sliver() -> tuple[np.ndarray, np.ndarray]:
+    """Single squashed tet10: corner volume/max_edge^3 ~ 4e-8.
+
+    Long-needle corners a=(0,0,0), b=(10,0,0), c=(5,0.005,0),
+    d=(5,0.0025,0.005); V = 4.17e-5 with max edge 10 -> ratio 4.2e-8,
+    far below the 1e-6 sliver threshold and far above the 1e-12
+    degenerate tolerance.  Midside nodes sit at straight edge midpoints
+    (VTK QUADRATIC_TETRA edge order (0,1),(1,2),(2,0),(0,3),(1,3),(2,3))
+    so curvature is zero and the corner geometry alone makes the cell
+    a sliver — geometric validity must catch it through the corner-
+    linearised grid.
+    """
+    corners = np.array([
+        [0, 0, 0], [10, 0, 0], [5, 0.005, 0], [5, 0.0025, 0.005],
+    ], float)
+    mids = [(0, 1), (1, 2), (2, 0), (0, 3), (1, 3), (2, 3)]
+    vertices = np.vstack(
+        [corners, [(corners[i] + corners[j]) / 2 for i, j in mids]])
+    cells = np.array([[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]])
+    return vertices, cells
+
+
 def build_volume_fixtures() -> dict:
     """name -> (vertices, cells, element type) for .vtu fixtures."""
     gv, gc = hex_grid(2, 2, 2)
@@ -630,6 +682,7 @@ def build_volume_fixtures() -> dict:
         "duplicate_cell": (dv, np.vstack([dc, dc[0]]), "hex8"),
         "leaky_volume": (*t_junction_volume(), "hex8"),
         "tet10_volume": (*tet10_volume(), "tet10"),
+        "quadratic_sliver": (*quadratic_sliver(), "tet10"),
     }
 
 
@@ -715,6 +768,82 @@ def write_nas_mixed_volume(path: Path) -> None:
     path.write_text(NAS_MIXED_DECK, encoding="ascii")
 
 
+# Gmsh 2.2 ASCII mixed volumetric fixture.  The tet10 keeps Gmsh's node
+# ordering (midsides at straight edge midpoints; the last two midside
+# entries differ from VTK's order, exercising the permutation), the
+# hex8 is VTK-ordered.  Physical groups 1 (fluid) and 2 (solid) become
+# cell_materials on load.
+GMSH_MIXED_DECK = """$ Gmsh 2.2 ASCII mixed volumetric fixture:
+$ tet10 (Gmsh node order) in group 1, hex8 in group 2.
+$MeshFormat
+2.2 0 8
+$EndMeshFormat
+$PhysicalNames
+2
+3 1 "fluid"
+3 2 "solid"
+$EndPhysicalNames
+$Nodes
+18
+1 0.0 0.0 0.0
+2 1.0 0.0 0.0
+3 0.0 1.0 0.0
+4 0.0 0.0 1.0
+5 0.5 0.0 0.0
+6 0.5 0.5 0.0
+7 0.0 0.5 0.0
+8 0.0 0.0 0.5
+9 0.0 0.5 0.5
+10 0.5 0.0 0.5
+11 5.0 0.0 0.0
+12 6.0 0.0 0.0
+13 6.0 1.0 0.0
+14 5.0 1.0 0.0
+15 5.0 0.0 1.0
+16 6.0 0.0 1.0
+17 6.0 1.0 1.0
+18 5.0 1.0 1.0
+$EndNodes
+$Elements
+2
+1 11 2 1 1 1 2 3 4 5 6 7 8 9 10
+2 5 2 2 2 11 12 13 14 15 16 17 18
+$EndElements
+"""
+
+
+def write_gmsh_mixed_volume(path: Path) -> None:
+    """Write the mixed Gmsh deck (see GMSH_MIXED_DECK)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(GMSH_MIXED_DECK, encoding="ascii")
+
+
+def write_meshio_volume(path: Path, ext: str) -> None:
+    """Write an optional-dep volume fixture via meshio (CGNS / Exodus).
+
+    Requires the delegate dependency meshio uses for the format (h5py
+    for .cgns, netCDF4 for .exo); callers catch ImportError when it is
+    absent so the fixture is simply not written.  meshio's CGNS
+    reader/writer pair only handles tetra cells, so CGNS gets the
+    two-unit-tet mesh while Exodus gets the clean 2x2x2 hex grid.
+    """
+    import meshio
+
+    if ext == "cgns":
+        pts = np.array([
+            [0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [0.25, 0.25, -1],
+        ], float)
+        blocks = [("tetra", np.array([[0, 1, 2, 3], [1, 0, 2, 4]]))]
+    else:
+        pts, hexes = hex_grid(2, 2, 2)
+        pts = np.asarray(pts, float)
+        blocks = [("hexahedron", np.asarray(hexes))]
+
+    mesh = meshio.Mesh(points=pts, cells=blocks)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mesh.write(str(path))
+
+
 def generate(force: bool = False) -> list:
     """Write all fixtures; returns list of written paths."""
     fixtures = build_fixtures()
@@ -757,6 +886,21 @@ def generate(force: bool = False) -> list:
     if not (nas_path.exists() and not force):
         write_nas_mixed_volume(nas_path)
         written.append(nas_path)
+    gmsh_path = SAMPLE_DIR / "gmsh_mixed_volume" / "gmsh_mixed_volume.msh"
+    if not (gmsh_path.exists() and not force):
+        write_gmsh_mixed_volume(gmsh_path)
+        written.append(gmsh_path)
+    # Optional-dep formats: written only when the delegate dependency
+    # (h5py for CGNS, netCDF4 for Exodus) is importable.
+    for name, ext in (("cgns_volume", "cgns"), ("exo_volume", "exo")):
+        p = SAMPLE_DIR / name / f"{name}.{ext}"
+        if p.exists() and not force:
+            continue
+        try:
+            write_meshio_volume(p, ext)
+        except ImportError:
+            continue
+        written.append(p)
     return written
 
 
@@ -788,9 +932,13 @@ async def verify() -> int:
         return ri.result, r2.result
 
     for name, contract in CONTRACTS.items():
+        requires = contract.get("requires")
+        if requires and importlib.util.find_spec(requires) is None:
+            print(f"skip {name}: requires {requires}")
+            continue
         d = SAMPLE_DIR / name
         path = None
-        for ext in ("stl", "obj", "vtu", "nas"):
+        for ext in ("stl", "obj", "vtu", "nas", "msh", "cgns", "exo"):
             cand = d / f"{name}.{ext}"
             if cand.exists():
                 path = cand

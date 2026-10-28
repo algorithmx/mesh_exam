@@ -15,9 +15,10 @@ Two layers are provided:
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
 from dataclasses import dataclass
 
 import numpy as np
@@ -31,7 +32,7 @@ from ..core.models import (
     IssueSeverity,
 )
 from ..operations.operation_registry import registry
-from ..utils.mesh_loader import load_mesh_from_file
+from ..utils.mesh_loader import load_mesh_from_file, save_mesh_to_file
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +127,9 @@ class MeshIssueExaminerServer:
     def __init__(
         self,
         config: Optional[OperationConfig] = None,
-        auto_register_operations: bool = True
+        auto_register_operations: bool = True,
+        enable_save_tool: bool = False,
+        allowed_save_dirs: Optional[List[Union[str, Path]]] = None,
     ):
         """
         Initialize the MCP server.
@@ -134,11 +137,25 @@ class MeshIssueExaminerServer:
         Args:
             config: Optional configuration for operations
             auto_register_operations: Whether to auto-register built-in operations
+            enable_save_tool: Register the ``mesh_save`` tool in the default
+                tool surface. Off by default so callers that pin the tool
+                list (``tools/list`` assertions) see an unchanged surface;
+                the FastMCP layer (:func:`create_mcp_server`) enables it.
+                The ``mesh_save`` *dispatch* in :meth:`handle_request` is
+                always available regardless of this flag.
+            allowed_save_dirs: Optional list of directories ``mesh_save``
+                may write into. When provided, an output_path that does
+                not resolve under one of these directories is rejected.
         """
         self.config = config or OperationConfig()
         self._mesh_cache: Dict[str, MeshInput] = {}
         self._result_cache: Dict[str, InspectionResult] = {}
         self._tools: Dict[str, MCPTool] = {}
+        self._enable_save_tool = enable_save_tool
+        self.allowed_save_dirs = (
+            [Path(d).resolve() for d in allowed_save_dirs]
+            if allowed_save_dirs is not None else None
+        )
 
         if auto_register_operations:
             self._register_builtin_tools()
@@ -305,6 +322,48 @@ class MeshIssueExaminerServer:
             }
         )
 
+        # Save mesh to file (opt-in: keeps the default tool surface stable)
+        if self._enable_save_tool:
+            self._tools['mesh_save'] = MCPTool(
+                name='mesh_save',
+                description=(
+                    'Save a previously loaded mesh to a file. The output '
+                    'format is driven by the file extension: .nas/.bdf use '
+                    'the native NASTRAN writer (quadratic CHEXA/CPENTA '
+                    'midside nodes retained); other supported extensions '
+                    'are written via meshio/pyvista. The parent directory '
+                    'must exist.'
+                ),
+                input_schema={
+                    'type': 'object',
+                    'properties': {
+                        'mesh_id': {
+                            'type': 'string',
+                            'description': 'Identifier returned by mesh_load.',
+                            'minLength': 1
+                        },
+                        'output_path': {
+                            'type': 'string',
+                            'description': (
+                                'Absolute path for the output file; the '
+                                'extension selects the format (e.g. .nas, '
+                                '.vtu, .msh, .stl).'
+                            ),
+                            'minLength': 1
+                        },
+                        'library': {
+                            'type': 'string',
+                            'enum': ['trimesh', 'pyvista', 'pymeshlab', 'meshio'],
+                            'description': (
+                                'Writer override for non-NASTRAN formats. '
+                                'Auto-detected when omitted.'
+                            )
+                        }
+                    },
+                    'required': ['mesh_id', 'output_path']
+                }
+            )
+
         # Clear cache
         self._tools['mesh_clear_cache'] = MCPTool(
             name='mesh_clear_cache',
@@ -357,6 +416,9 @@ class MeshIssueExaminerServer:
 
             elif method == 'mesh_get_quality_metrics':
                 result = self._handle_get_quality_metrics(request.params)
+
+            elif method == 'mesh_save':
+                result = self._handle_save(request.params)
 
             elif method == 'mesh_clear_cache':
                 result = self._handle_clear_cache(request.params)
@@ -585,6 +647,47 @@ class MeshIssueExaminerServer:
 
         return {'status': 'cleared', 'cleared_ids': cleared}
 
+    def _handle_save(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle mesh save request (extension-driven format selection)."""
+        mesh_id = params['mesh_id']
+        mesh = self._mesh_cache.get(mesh_id)
+        if mesh is None:
+            raise ValueError(f"Mesh not found: {mesh_id}")
+
+        out_path = Path(params['output_path']).resolve()
+        if out_path.suffix == '':
+            raise ValueError(
+                f"output_path must include a file extension so the output "
+                f"format can be selected: {out_path}"
+            )
+        if not out_path.parent.exists():
+            raise ValueError(f"Output directory does not exist: {out_path.parent}")
+
+        if self.allowed_save_dirs is not None:
+            inside = any(
+                str(out_path) == str(d)
+                or str(out_path).startswith(str(d) + os.sep)
+                for d in self.allowed_save_dirs
+            )
+            if not inside:
+                raise ValueError(
+                    f"Output '{out_path}' is outside allowed save "
+                    f"directories: {[str(d) for d in self.allowed_save_dirs]}"
+                )
+
+        save_mesh_to_file(mesh, out_path, library=params.get('library'))
+
+        return {
+            'mesh_id': mesh_id,
+            'path': str(out_path),
+            'format': out_path.suffix[1:].lower(),
+            'bytes': os.path.getsize(out_path),
+            'n_vertices': mesh.n_vertices,
+            'n_volume_cells': (
+                mesh.n_volume_cells if mesh.has_volume_cells else 0
+            ),
+        }
+
     def __repr__(self) -> str:
         return f"<MeshIssueExaminerServer: {len(self._tools)} tools, {len(self._mesh_cache)} cached meshes>"
 
@@ -622,6 +725,7 @@ def create_mcp_server(
     backend = MeshIssueExaminerServer(
         config=config,
         auto_register_operations=auto_register_operations,
+        enable_save_tool=True,
     )
 
     mcp = FastMCP("mesh-issue-examiner")
@@ -818,6 +922,52 @@ def create_mcp_server(
         if metric_name is not None:
             params["metric_name"] = metric_name
         result = backend._handle_get_quality_metrics(params)
+        return json.dumps(result, indent=2)
+
+    # -- mesh_save ---------------------------------------------------------
+
+    @mcp.tool()
+    async def mesh_save(
+        mesh_id: str,
+        output_path: str,
+        library: str | None = None,
+    ) -> str:
+        """Save a previously loaded mesh to a file.
+
+        The output format is driven by the output file's extension.
+        NASTRAN decks (.nas/.bdf) are written by the native free-field
+        writer (quadratic CHEXA/CPENTA midside nodes retained); other
+        formats (.vtu/.vtk/.msh/.stl/...) are written via meshio/pyvista.
+
+        Args:
+            mesh_id: Identifier returned by mesh_load.
+            output_path: Absolute path for the output file. The parent
+                directory must exist; the extension selects the format.
+            library: Writer override for non-NASTRAN formats -- "trimesh"
+                | "pyvista" | "pymeshlab" | "meshio". Auto-detected from
+                the extension when omitted.
+
+        Returns:
+            JSON with mesh_id, path, format, bytes, n_vertices, and
+            n_volume_cells.
+
+        Errors:
+            ValueError -- mesh_id not found, missing file extension,
+                missing output directory, or output_path outside the
+                server's allowed save directories (when configured).
+
+        Example::
+
+            mesh_save(mesh_id="bracket", output_path="out/bracket.nas")
+            mesh_save(mesh_id="bracket", output_path="out/bracket.vtu")
+        """
+        params: Dict[str, Any] = {
+            "mesh_id": mesh_id,
+            "output_path": output_path,
+        }
+        if library is not None:
+            params["library"] = library
+        result = await backend._handle_save(params)
         return json.dumps(result, indent=2)
 
     # -- mesh_clear_cache -------------------------------------------------

@@ -9,6 +9,13 @@ vtk>=9.2.0
 pymeshlab>=2022.2
 meshio>=5.0.0
 
+# Optional I/O backends: meshio delegates CGNS (.cgns) to h5py and
+# Exodus (.e/.exo) to netCDF4; without them those formats fail at read
+# time. Install to enable:
+#   pip install h5py netCDF4
+# h5py>=3.8.0
+# netCDF4>=1.6.0
+
 # MCP server
 pydantic>=2.0.0
 mcp>=1.0.0,<2.0.0

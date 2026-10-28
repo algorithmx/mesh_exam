@@ -16,6 +16,66 @@ from .exceptions import QualityMetricError, FileIOError, MeshConversionError
 
 logger = logging.getLogger(__name__)
 
+# meshio cell type name -> internal canonical element type name.
+# Complete map including the quadratic volumetric variants: 'wedge15'
+# is meshio's name for the 15-node quadratic prism (canonical prism15).
+MESHIO_TO_CANONICAL = {
+    'tetra': 'tet4',
+    'hexahedron': 'hex8',
+    'wedge': 'prism6',
+    'pyramid': 'pyramid5',
+    # Quadratic variants
+    'tetra10': 'tet10',
+    'hexahedron20': 'hex20',
+    'hexahedron27': 'hex27',
+    'wedge15': 'prism15',
+    'wedge18': 'wedge18',
+    'pyramid13': 'pyramid13',
+    'pyramid14': 'pyramid14',
+}
+
+# Canonical element type name -> meshio cell type name (for writing).
+CANONICAL_TO_MESHIO = {v: k for k, v in MESHIO_TO_CANONICAL.items()}
+
+# Fallback linear (meshio type, corner node count) for quadratic volume
+# elements when the installed meshio cannot construct the quadratic cell
+# block. meshio orders corner nodes first (VTK ordering), so truncating the
+# connectivity yields the linear element.
+MESHIO_VOLUME_FALLBACK = {
+    'tetra10': ('tetra', 4),
+    'hexahedron20': ('hexahedron', 8),
+    'hexahedron27': ('hexahedron', 8),
+    'wedge15': ('wedge', 6),
+    'wedge18': ('wedge', 6),
+    'pyramid13': ('pyramid', 5),
+    'pyramid14': ('pyramid', 5),
+}
+
+# Probe cache: meshio type name -> constructible with installed meshio?
+_MESHIO_TYPE_SUPPORT: Dict[str, bool] = {}
+
+
+def _meshio_type_supported(meshio_type: str, width: int) -> bool:
+    """Return whether the installed meshio can construct ``meshio_type``.
+
+    Some names listed in meshio's ``num_nodes_per_cell`` are missing from
+    its internal dimension table (e.g. 'wedge15' and 'pyramid13' in meshio
+    5.3.x), so building a CellBlock raises KeyError. Probe once per type
+    and cache the result so callers can fall back to the linear element.
+    """
+    if meshio_type not in _MESHIO_TYPE_SUPPORT:
+        import meshio
+        try:
+            meshio.Mesh(
+                points=np.zeros((width, 3)),
+                cells=[(meshio_type,
+                        np.arange(width, dtype=int).reshape(1, width))],
+            )
+            _MESHIO_TYPE_SUPPORT[meshio_type] = True
+        except Exception:
+            _MESHIO_TYPE_SUPPORT[meshio_type] = False
+    return _MESHIO_TYPE_SUPPORT[meshio_type]
+
 
 class MeshioAdapter(MeshAdapter):
     """
@@ -125,7 +185,11 @@ class MeshioAdapter(MeshAdapter):
         """
         Create meshio mesh from canonical format.
 
-        Supports both surface and volumetric meshes.
+        Supports both surface and volumetric meshes, including the
+        quadratic element variants (tetra10/hexahedron20/hexahedron27/
+        wedge15/wedge18/pyramid13/pyramid14).  Volume blocks are emitted
+        in ``volume_cells`` insertion order so per-cell arrays (e.g.
+        materials) stay aligned; the surface triangle block comes last.
         """
         import meshio
 
@@ -133,16 +197,24 @@ class MeshioAdapter(MeshAdapter):
 
         # Add volume cells if present
         if mesh_input.has_volume_cells:
-            etype_map = {
-                'tet4': 'tetra',
-                'hex8': 'hexahedron',
-                'prism6': 'wedge',
-                'pyramid5': 'pyramid',
-            }
             for etype, connectivity in mesh_input._volume_cells.items():
-                meshio_type = etype_map.get(etype)
-                if meshio_type:
+                meshio_type = CANONICAL_TO_MESHIO.get(etype)
+                if meshio_type is None:
+                    raise MeshConversionError(
+                        f"No meshio cell type for canonical element "
+                        f"type '{etype}'")
+                connectivity = np.asarray(connectivity)
+                if _meshio_type_supported(meshio_type, connectivity.shape[1]):
                     cells.append((meshio_type, connectivity))
+                else:
+                    fallback_type, corner_count = MESHIO_VOLUME_FALLBACK[
+                        meshio_type]
+                    logger.info(
+                        "Installed meshio cannot represent '%s'; writing "
+                        "corner-reduced '%s' instead",
+                        meshio_type, fallback_type)
+                    cells.append(
+                        (fallback_type, connectivity[:, :corner_count]))
 
         # Add surface faces if present
         if len(mesh_input.faces) > 0:
@@ -158,48 +230,48 @@ class MeshioAdapter(MeshAdapter):
         Convert meshio mesh to canonical MeshInput format.
 
         Automatically extracts volumetric cells and surface faces.
+        Repeated blocks of the same element type are concatenated in
+        file order; quad surface blocks are triangulated (corner nodes
+        first for the quadratic variants) instead of dropped.
         """
         from ..core.models import MeshInput
 
         vertices = mesh.points
 
-        # Extract cells by type
-        volume_cells = {}
-        faces = np.array([])
+        volume_cells: Dict[str, List[np.ndarray]] = {}
+        tri_blocks: List[np.ndarray] = []
 
-        # meshio cell type names to our internal names
-        volume_type_map = {
-            'tetra': 'tet4',
-            'hexahedron': 'hex8',
-            'wedge': 'prism6',
-            'pyramid': 'pyramid5',
-            # Quadratic variants
-            'tetra10': 'tet10',
-            'hexahedron20': 'hex20',
-            'wedge15': 'wedge15',
-            'pyramid13': 'pyramid13',
-        }
-
-        surface_types = {'triangle', 'quad', 'triangle6', 'quad9'}
+        surface_types = {'triangle', 'quad', 'triangle6', 'quad8', 'quad9'}
 
         for cell_block in mesh.cells:
             cell_type = cell_block.type
-            connectivity = cell_block.data
+            connectivity = np.asarray(cell_block.data)
 
-            if cell_type in volume_type_map:
-                internal_type = volume_type_map[cell_type]
-                volume_cells[internal_type] = connectivity
+            internal_type = MESHIO_TO_CANONICAL.get(cell_type)
+            if internal_type is not None:
+                volume_cells.setdefault(internal_type, []).append(connectivity)
             elif cell_type in surface_types:
-                # For surface meshes, use triangle data
                 if cell_type in ('triangle', 'triangle6'):
-                    faces = connectivity
+                    conn = (connectivity if cell_type == 'triangle'
+                            else connectivity[:, :3])
+                    tri_blocks.append(conn)
+                else:  # quad / quad8 / quad9: corners then two triangles
+                    conn = connectivity[:, :4]
+                    tri_blocks.append(conn[:, [0, 1, 2]])
+                    tri_blocks.append(conn[:, [0, 2, 3]])
+
+        faces = np.vstack(tri_blocks) if tri_blocks else np.array([])
+        merged = {
+            etype: (blocks[0] if len(blocks) == 1 else np.vstack(blocks))
+            for etype, blocks in volume_cells.items()
+        }
 
         return MeshInput(
             vertices=vertices,
             faces=faces,
             mesh_id=mesh_id,
             source_format='meshio',
-            volume_cells=volume_cells if volume_cells else None
+            volume_cells=merged if merged else None
         )
 
     def get_vertices(self, mesh: 'meshio.Mesh') -> np.ndarray:
@@ -218,22 +290,21 @@ class MeshioAdapter(MeshAdapter):
         return np.array([])
 
     def get_volume_cells(self, mesh: 'meshio.Mesh') -> Dict[str, np.ndarray]:
-        """Extract volumetric cells as dictionary."""
-        volume_type_map = {
-            'tetra': 'tet4',
-            'hexahedron': 'hex8',
-            'wedge': 'prism6',
-            'pyramid': 'pyramid5',
-            'tetra10': 'tet10',
-            'hexahedron20': 'hex20',
-        }
+        """Extract volumetric cells as dictionary.
 
-        volume_cells = {}
+        Uses the complete type map (quadratic variants included) and
+        concatenates repeated blocks of the same element type.
+        """
+        blocks: Dict[str, List[np.ndarray]] = {}
         for cell_block in mesh.cells:
-            internal_type = volume_type_map.get(cell_block.type)
+            internal_type = MESHIO_TO_CANONICAL.get(cell_block.type)
             if internal_type:
-                volume_cells[internal_type] = np.array(cell_block.data)
-        return volume_cells
+                blocks.setdefault(internal_type, []).append(
+                    np.asarray(cell_block.data))
+        return {
+            etype: (parts[0] if len(parts) == 1 else np.vstack(parts))
+            for etype, parts in blocks.items()
+        }
 
     def is_watertight(self, mesh: 'meshio.Mesh') -> bool:
         """

@@ -3,7 +3,7 @@
 **Report Date:** 2026-04-10
 **Last Updated:** 2026-10-28
 **Component:** mesh_issue_examiner - Volumetric (3D) Mesh Operations
-**Status:** 11 Gaps Closed · 1 Partially Closed · 1 Open
+**Status:** 12 Gaps Closed · 1 Open
 
 ---
 
@@ -18,7 +18,7 @@ The mesh_issue_examiner framework has foundational support for volumetric (3D) m
 - Winding Consistency **extended to all element types** (tet4, hex8, prism6, pyramid5)
 - **4 linear + 7 quadratic element types** now supported (tet4/10, hex8/20/27, prism6/15, wedge18, pyramid5/13/14)
 - **Quadratic topology checks enabled** via corner-first face resolution (`_face_tables.py`): non-manifold faces, orientation winding, duplicate/orphaned cells, boundary closure all analyze quadratic cells through their corner nodes
-- **Sliver detection extended** to all 4 linear element types (tet4, hex8, prism6, pyramid5)
+- **Sliver detection extended** to all 4 linear element types and, through corner-linearised blocks, to quadratic cells (tet10, hex20/27, prism15, wedge18, pyramid13/14)
 - **4 new topological operations** added: DisconnectedComponentDetection, IsolatedVertexDetection, DuplicateFaceDetection, DuplicateVertexDetection
 - **3 new volumetric connectivity operations** added (2026-10-27): DuplicateCellDetection, OrphanedCellDetection, BoundaryClosureCheck
 - **6 extended quality metrics** implemented (warpage, equiangle_skew, stretch, taper, radius_ratio, collapse_ratio) with thresholds and element applicability
@@ -27,7 +27,11 @@ The mesh_issue_examiner framework has foundational support for volumetric (3D) m
 - **Multi-material end-to-end** (2026-10-28): `material_array_name` exposed on both MCP layers; interface detection, interface quality and per-material statistics fire on the `two_material_volume` fixture
 - **Clean volumes pass full inspection** (2026-10-28): face-winding tables normalised to the outward convention and volume-aware 2D surface ops, so `closed_volume` reports zero issues
 - **NASTRAN higher-order retention** (2026-10-28): CHEXA20 → hex20 and CPENTA15 → prism15 with midside nodes kept (ordering matches VTK); corner reduction only for forms with no registered type
-- **Remaining open** — parallelization for very large meshes only; dedicated Gmsh/CGNS/Exodus readers stay delegated to meshio by design
+- **Native Gmsh reader** (2026-10-28): `.msh` 2.2 ASCII parsed natively (`utils/gmsh_parser.py`) with physical-group materials; meshio remains the fallback for other Gmsh versions
+- **CGNS/Exodus verified delegation** (2026-10-28): `.cgns`/`.exo` load through meshio behind optional `h5py`/`netCDF4` dependencies with capability-gated e2e coverage and actionable install hints
+- **NASTRAN write-back + `mesh_save` MCP tool** (2026-10-28): `write_nas` emits free-field CTETRA/CHEXA/CPENTA cards (round-trip verified for tet4/hex20/prism15); `mesh_save` exposes saving through the MCP layer (opt-in `enable_save_tool`)
+- **Midside-curvature diagnostic** (2026-10-28): `midside_deviation` quality metric measures quadratic midside-node offsets from corner-edge midpoints using VTK-verified slot tables (face/body centres excluded)
+- **Remaining open** — parallelization for very large meshes only
 
 ---
 
@@ -121,7 +125,7 @@ The mesh_issue_examiner framework has foundational support for volumetric (3D) m
 
 **Location:** `mesh_issue_examiner/operations/volumetric/geometric_validity.py`
 
-**Status:** ✅ **COMPLETED** (2026-03-31)
+**Status:** ✅ **COMPLETED** (2026-03-31; quadratic types 2026-10-28)
 
 **Implementation Summary:**
 All four linear element types now have dedicated sliver detectors:
@@ -134,6 +138,8 @@ All four linear element types now have dedicated sliver detectors:
 | `pyramid5` | `_detect_sliver_pyramids()` | 8 edges |
 
 A `detector_map` dictionary dispatches each element type to its detector, and `_compute_element_offset()` replaces the old tet-specific offset helper. Each detector follows the same pattern: compute edge lengths from vertex coordinates, compute `volume / max_edge³` ratio, and flag cells below threshold.
+
+**Quadratic extension (2026-10-28):** detection runs over the corner-linearised cell table (`linearized_volume_cells` in `_face_tables.py`), so quadratic cells (tet10, hex20/27, prism15, wedge18, pyramid13/14) are visited by their linear base type's detector with corner-only connectivity. Global cell numbering is preserved, enabling attribution back to the original element type; the issue metrics report per-type counts (`sliver_<type>_count`).
 
 ---
 
@@ -211,21 +217,21 @@ All linear and quadratic element types added to `ELEMENT_NODE_COUNT`; complete q
 | DuplicateCellDetection | ✅ | ✅ | ✅ | ✅ |
 | OrphanedCellDetection | ✅ | ✅ | ✅ | ✅ |
 | BoundaryClosureCheck | ✅ | ✅ | ✅ | ✅ |
-| GeometricValidity (sliver) | ✅ | ⚠️ linear detectors only (quadratic blocks not visited) | ⚠️ linear detectors only | ⚠️ not visited (no detector) |
+| GeometricValidity (sliver) | ✅ | ✅ (corner-linearised blocks) | ✅ (corner-linearised blocks) | ✅ (pyramid5 corners) |
 | VolumeCellQuality | ✅ | ✅ (corner linearization, tagged) | ✅ (corner linearization, tagged) | ✅ (corner linearization via pyramid5) |
 
 **Known limitations:**
 1. ~~**VTK quality sentinel**~~ — **resolved 2026-10-28**: `volume_cell_quality.py` detects quadratic element types, rebuilds a corner-only linear grid (`_linearized_volume_cells`) and computes every metric there, attributing values to the original cells with a `linearized` provenance tag in the `QualityMetrics` metadata. Midside curvature is ignored, so linearised quadratic metrics are approximations bounded by the corner-equivalence unit test. The inverted-cell check still filters any residual -1 sentinel.
-2. **pyramid14 has no VTK cell** — VTK's tri-quadratic pyramid has 19 nodes, not 14. pyramid14 remains connectivity-level for native conversion (`MeshConversionError`), but 3D quality now reaches it through its pyramid5 corners (linearized). Self-intersection and other strictly native checks still skip gracefully.
+2. **pyramid14 has no VTK cell** — VTK's tri-quadratic pyramid has 19 nodes, not 14. Since 2026-10-28 `MeshInput` builds a native pyramid5-corner grid as a fallback instead of raising `MeshConversionError`, so self-intersection, geometric validity (slivers) and quality all reach pyramid14 through its corners; the corner fallback is recorded in grid metadata.
 3. ~~**hex8 winding convention**~~ — **resolved 2026-10-28**: `ELEMENT_FACES` was recalibrated so every face tuple follows the outward right-hand rule under VTK node ordering (hex8 bottom `(3,2,1,0)`, prism6 bottom `(2,1,0)`, pyramid5 base `(3,2,1,0)`, tet4 normalised). Stacked-cell interfaces now list shared faces in opposing directions and clean grids pass `check_orientation_consistency`.
 
 ---
 
-### 6. No Volumetric Mesh File Loaders ⚠️ PARTIALLY RESOLVED
+### 6. No Volumetric Mesh File Loaders ✅ RESOLVED
 
-**Location:** `mesh_issue_examiner/utils/mesh_loader.py`, `mesh_issue_examiner/utils/nas_parser.py`
+**Location:** `mesh_issue_examiner/utils/mesh_loader.py`, `mesh_issue_examiner/utils/nas_parser.py`, `mesh_issue_examiner/utils/gmsh_parser.py`
 
-**Status:** ⚠️ **PARTIALLY COMPLETED** (2026-10-27)
+**Status:** ✅ **COMPLETED** (2026-10-28)
 
 **What was done:**
 - `load_mesh_from_file()` now accepts `extract_volume_cells=True` parameter
@@ -243,13 +249,12 @@ mesh = load_mesh_from_file("simulation.vtu")  # Returns MeshInput with volume_ce
 mesh = load_mesh_from_file("model.nas")       # CTETRA/CHEXA/CPENTA extracted
 ```
 
-**Remaining gaps:**
-- No dedicated Gmsh reader (relies on meshio delegation)
-- No dedicated CGNS/Exodus readers (relies on meshio)
+**Closing work (2026-10-28):**
+- **Native Gmsh reader** (`utils/gmsh_parser.py`): `.msh` 2.2 ASCII parsed directly with physical-group material extraction; `load_mesh_from_file` routes to it first and falls back to meshio for other Gmsh versions (`gmsh_mixed_volume` fixture + e2e contract)
+- **Verified CGNS/Exodus delegation**: `h5py`/`netCDF4` are optional dependencies (declared via setup extras) and missing-dependency errors carry install hints; capability-gated e2e covers `.cgns`/`.exo`
+- **NASTRAN write-back**: `write_nas` emits free-field CTETRA/CHEXA/CPENTA cards; `.nas`/`.bdf` round-trips are pinned by unit and e2e tests; saving is exposed through the opt-in `mesh_save` MCP tool (`enable_save_tool=True` in `create_mcp_server`)
 
 (The higher-order NASTRAN bullet closed on 2026-10-28: CHEXA20/CPENTA15 are retained as hex20/prism15.)
-
-**Effort Estimate for remaining:** Medium (2-3 days)
 
 ---
 
@@ -309,7 +314,7 @@ Volumetric quality metrics were limited to those directly supported by VTK's `ce
 
 **Validation:** `test_extended_quality_metrics.py` (metric applicability, thresholds, higher-is-worse direction), `TestLinearizedQuality` in `test_higher_order_elements.py` (no sentinels, provenance tag, exact corner-equivalence on tet10, pyramid14 metrics, mixed-mesh cell ordering), e2e `test_tet10_quality_metrics_linearized` and `test_retained_hex20_gets_linearized_quality` (MCP metrics on the tet10 and NASTRAN hex20 fixtures)
 
-**Residual limitation:** linearized quadratic metrics approximate midside curvature by straight edges — labeled in metric metadata and bounded by the corner-equivalence tolerance test.  Sliver detection (`geometric_validity.py`) still visits linear element blocks only; quadratic slivers are covered indirectly by the linearized `scaled_jacobian`/`volume` thresholds.
+**Residual limitation:** linearized quadratic metrics approximate midside curvature by straight edges — labeled in metric metadata and bounded by the corner-equivalence tolerance test.  Quadratic sliver detection now visits quadratic cells directly via the corner-linearised blocks (2026-10-28), and the `midside_deviation` metric recovers an exact midside-geometry curvature signal as a quadratic-only diagnostic.
 
 ---
 
@@ -432,10 +437,10 @@ Current tests in `test_three_new_operations.py` cover:
 | Test | Priority | Description |
 |------|----------|-------------|
 | ~~Higher-order elements~~ | Medium | ✅ Covered by `test_higher_order_elements.py` (registration, corner face tables, ops on quadratic meshes, pyramid14 degradation, linearized quality) plus tet10/hex20 e2e fixtures |
-| Large mesh performance | Medium | >1M cell mesh handling |
+| ~~Large mesh performance~~ | Medium | ✅ Covered by `tests/test_large_mesh_smoke.py` — 1M-cell hex8 structured volume through full MCP inspect (`-m slow`) |
 | ~~All quality metrics~~ | Medium | ✅ Covered by `test_extended_quality_metrics.py` (per-metric applicability, thresholds, direction) and the linearized-quality tests |
 | ~~File loading~~ | High | ✅ `.vtu` volume fixtures + `.nas` e2e (`TestNastranMixedVolume`, hex20 retention) + `.msh`/`.cgns`/`.exo` via meshio delegation |
-| Duplicate vertex detection | Medium | Tests for DuplicateVertexDetection operation |
+| ~~Duplicate vertex detection~~ | Medium | ✅ Covered by `tests/test_bad_meshes.py` (duplicate-vertex mesh builder with 3 detection assertions) |
 
 ---
 
@@ -466,7 +471,7 @@ Current tests in `test_three_new_operations.py` cover:
 | Scaled Jacobian | ✅ | ✅ | ✅ | ✅ | ✅ (tagged `linearized`) |
 | Condition | ✅ | ✅ | ✅ | ✅ | ✅ (tagged `linearized`) |
 | Skewness | ✅ | ✅ | ✅ | ✅ | ✅ (tagged `linearized`) |
-| Sliver Detection | ✅ | ✅ | ✅ | ✅ | ⚠️ linear blocks only (indirect via linearized scaled_jacobian/volume) |
+| Sliver Detection | ✅ | ✅ | ✅ | ✅ | ✅ corner-linearised blocks (quadratic slivers detected directly, 2026-10-28) |
 | Winding Check | ✅ | ✅ | ✅ | ✅ | ✅ (corner faces, outward convention since 2026-10-28) |
 | Warpage | N/A | ✅ | ✅ | ✅ | ✅ (tagged `linearized`) |
 | Equiangle Skew | ✅ | ✅ | ✅ | ✅ | ✅ (tagged `linearized`) |
@@ -474,6 +479,7 @@ Current tests in `test_three_new_operations.py` cover:
 | Taper | N/A | ✅ | N/A | N/A | ✅ hex20/hex27 (tagged `linearized`) |
 | Radius Ratio | ✅ | N/A | N/A | N/A | ✅ tet10 (tagged `linearized`) |
 | Collapse Ratio | ✅ | ✅ | ✅ | ✅ | ✅ (tagged `linearized`) |
+| Midside Deviation | N/A | N/A | N/A | N/A | ✅ quadratic-only — exact midside geometry, VTK-verified slots; face/body centres ignored (2026-10-28) |
 
 ### Topological Operations
 
@@ -497,10 +503,10 @@ Current tests in `test_three_new_operations.py` cover:
 |--------|------|-------|--------------|-------|
 | .vtu | ✅ (via adapter) | ✅ (meshio) | ✅ | Full support via PyVista/Meshio |
 | .vtk | ✅ (via adapter) | ✅ (meshio) | ✅ | Full support via PyVista/Meshio |
-| .nas/.bdf | ✅ (custom parser) | ❌ | ✅ (CTETRA/CHEXA/CPENTA) | NASTRAN parser extracts all three volume cards; 20/15-node forms retained as hex20/prism15 (2026-10-28) |
-| .msh | ✅ (meshio) | ✅ (meshio) | ✅ | Gmsh format via meshio |
-| .cgns | ✅ (meshio) | ❌ | ✅ | CGNS format via meshio |
-| .exo | ✅ (meshio) | ❌ | ✅ | Exodus format via meshio |
+| .nas/.bdf | ✅ (custom parser) | ✅ (write_nas) | ✅ (CTETRA/CHEXA/CPENTA) | NASTRAN parser extracts all three volume cards; 20/15-node forms retained as hex20/prism15; write-back emits free-field cards (2026-10-28) |
+| .msh | ✅ (native 2.2 ASCII; meshio fallback) | ✅ (meshio) | ✅ | Native Gmsh reader with physical-group materials; meshio fallback for other versions |
+| .cgns | ✅ (verified meshio delegation) | ❌ | ✅ | Requires optional h5py; install hint on missing dependency |
+| .exo | ✅ (verified meshio delegation) | ❌ | ✅ | Requires optional netCDF4; install hint on missing dependency |
 | .xdmf | ✅ (meshio) | ✅ (meshio) | ✅ | XDMF format via meshio |
 | .inp | ✅ (meshio) | ❌ | ✅ | Abaqus format via meshio |
 | .stl | ✅ (surface only) | ✅ | ❌ | Surface mesh format |
@@ -510,4 +516,4 @@ Current tests in `test_three_new_operations.py` cover:
 ---
 
 *Report generated by code analysis of mesh_issue_examiner framework*
-*Last updated: 2026-10-28 — progress audit against current codebase (phases 1-6: multi-material e2e, boundary-layer calibration, winding recalibration, quadratic quality linearization, NASTRAN higher-order retention)*
+*Last updated: 2026-10-28 — progress audit against current codebase (phases 1-6: multi-material e2e, boundary-layer calibration, winding recalibration, quadratic quality linearization, NASTRAN higher-order retention; closure pass: quadratic sliver detection, pyramid14 corner-fallback native conversion, native Gmsh reader, verified CGNS/Exodus delegation, NASTRAN write-back, `mesh_save` MCP tool, `midside_deviation` metric, 1M-cell perf smoke)*

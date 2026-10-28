@@ -419,6 +419,170 @@ class TestErrorHandling:
 
 
 # =============================================================================
+# meshio quadratic fidelity (complete type maps, block concatenation,
+# quad-surface triangulation, quadratic emission on save)
+# =============================================================================
+
+class TestMeshioQuadraticFidelity:
+    """canonical -> meshio -> canonical must preserve quadratic cells."""
+
+    # In-memory round-trip set: only types the installed meshio can
+    # actually construct (wedge15/pyramid13 are not constructible in
+    # meshio 5.3.x -- they are covered by the map-contract and
+    # corner-fallback tests below).
+    _TYPES_AND_WIDTHS = [
+        ('tet4', 4), ('hex8', 8), ('prism6', 6), ('pyramid5', 5),
+        ('tet10', 10), ('hex20', 20), ('hex27', 27),
+        ('wedge18', 18), ('pyramid14', 14),
+    ]
+
+    def _all_types_mesh(self):
+        """One cell of every registered type; indices span 0..59."""
+        vertices = np.arange(60 * 3, dtype=float).reshape(-1, 3) * 0.1
+        volume_cells = {
+            etype: np.array([list(range(width))])
+            for etype, width in self._TYPES_AND_WIDTHS
+        }
+        return MeshInput(
+            vertices=vertices,
+            faces=np.zeros((0, 3), dtype=int),
+            mesh_id='all_types',
+            volume_cells=volume_cells,
+        )
+
+    def test_round_trip_preserves_all_types_and_order(self):
+        meshio = pytest.importorskip("meshio")
+
+        original = self._all_types_mesh()
+        adapter = MeshioAdapter()
+        native = adapter.from_canonical(original)
+        out = adapter.to_canonical(native, mesh_id='roundtrip')
+
+        assert list(out.volume_cells) == list(original.volume_cells)
+        for etype in original.volume_cells:
+            assert out.volume_cells[etype].shape == original.volume_cells[etype].shape, etype
+            np.testing.assert_array_equal(
+                out.volume_cells[etype], original.volume_cells[etype], err_msg=etype)
+
+    def test_quadratic_type_map_contract(self):
+        """Regression: meshio's wedge15 is the canonical prism15 (not a
+        bogus internal 'wedge15' type), and pyramid13 maps to pyramid13.
+        These names cannot be constructed in-memory by meshio 5.3.x, so
+        pin the read-side map directly."""
+        pytest.importorskip("meshio")
+        from mesh_issue_examiner.adapters.meshio_adapter import (
+            MESHIO_TO_CANONICAL, CANONICAL_TO_MESHIO)
+
+        assert MESHIO_TO_CANONICAL['wedge15'] == 'prism15'
+        assert CANONICAL_TO_MESHIO['prism15'] == 'wedge15'
+        assert MESHIO_TO_CANONICAL['pyramid13'] == 'pyramid13'
+        assert CANONICAL_TO_MESHIO['pyramid13'] == 'pyramid13'
+
+        # wedge18 IS constructible and must round-trip in memory
+        meshio = pytest.importorskip("meshio")
+        native = meshio.Mesh(
+            points=np.zeros((18, 3)),
+            cells=[('wedge18', np.array([list(range(18))]))],
+        )
+        out = MeshioAdapter().to_canonical(native)
+        assert list(out.volume_cells) == ['wedge18']
+        assert out.volume_cells['wedge18'].shape == (1, 18)
+
+    def test_unsupported_quadratic_volume_types_fall_back_to_corners(self):
+        """prism15/pyramid13 cannot be written by meshio 5.3.x; from_canonical
+        must degrade to corner-only linear blocks (in insertion order)
+        instead of crashing."""
+        pytest.importorskip("meshio")
+
+        mesh = MeshInput(
+            vertices=np.arange(20 * 3, dtype=float).reshape(-1, 3) * 0.1,
+            faces=np.zeros((0, 3), dtype=int),
+            mesh_id='fallback',
+            volume_cells={
+                'tet10': np.array([list(range(10))]),
+                'prism15': np.array([list(range(15))]),
+                'pyramid13': np.array([list(range(13))]),
+            },
+        )
+        native = MeshioAdapter().from_canonical(mesh)
+        block_types = [block.type for block in native.cells]
+        assert block_types == ['tetra10', 'wedge', 'pyramid']
+        assert native.cells[1].data.shape == (1, 6)
+        assert native.cells[2].data.shape == (1, 5)
+
+        # Reading the degraded mesh back yields linear types plus the
+        # untouched quadratic tet10.
+        out = MeshioAdapter().to_canonical(native)
+        assert list(out.volume_cells) == ['tet10', 'prism6', 'pyramid5']
+        np.testing.assert_array_equal(
+            out.volume_cells['tet10'], mesh.volume_cells['tet10'])
+
+    def test_repeated_blocks_concatenate_in_order(self):
+        meshio = pytest.importorskip("meshio")
+
+        native = meshio.Mesh(
+            points=np.zeros((8, 3)),
+            cells=[
+                ('tetra', np.array([[0, 1, 2, 3]])),
+                ('tetra', np.array([[4, 5, 6, 7]])),
+            ],
+        )
+        out = MeshioAdapter().to_canonical(native)
+        assert list(out.volume_cells) == ['tet4']
+        assert out.volume_cells['tet4'].shape == (2, 4)
+        np.testing.assert_array_equal(
+            out.volume_cells['tet4'], [[0, 1, 2, 3], [4, 5, 6, 7]])
+
+    def test_quad_surface_blocks_are_triangulated(self):
+        meshio = pytest.importorskip("meshio")
+
+        native = meshio.Mesh(
+            points=np.zeros((4, 3)),
+            cells=[('quad', np.array([[0, 1, 2, 3]]))],
+        )
+        out = MeshioAdapter().to_canonical(native)
+        assert out.volume_cells == {}
+        assert out.faces.shape == (2, 3)
+        np.testing.assert_array_equal(out.faces, [[0, 1, 2], [0, 2, 3]])
+
+    def test_triangle6_surface_uses_corner_nodes(self):
+        meshio = pytest.importorskip("meshio")
+
+        native = meshio.Mesh(
+            points=np.zeros((6, 3)),
+            cells=[('triangle6', np.array([list(range(6))]))],
+        )
+        out = MeshioAdapter().to_canonical(native)
+        assert out.faces.shape == (1, 3)
+        np.testing.assert_array_equal(out.faces, [[0, 1, 2]])
+
+    def test_vtu_file_round_trip_keeps_quadratic_cells(self, tmp_path):
+        """The save path emits quadratic blocks: writing and re-reading a
+        .vtu through meshio preserves tet10/hex20 connectivity."""
+        meshio = pytest.importorskip("meshio")
+
+        mesh = MeshInput(
+            vertices=np.arange(20 * 3, dtype=float).reshape(-1, 3) * 0.1,
+            faces=np.zeros((0, 3), dtype=int),
+            mesh_id='quadratic_roundtrip',
+            volume_cells={
+                'tet10': np.array([list(range(10))]),
+                'hex20': np.array([list(range(20))]),
+            },
+        )
+
+        adapter = MeshioAdapter()
+        native = adapter.from_canonical(mesh)
+        target = tmp_path / 'quadratic.vtu'
+        adapter.save_mesh(native, str(target))
+
+        reloaded = MeshioAdapter().to_canonical(meshio.read(str(target)))
+        assert set(reloaded.volume_cells) == {'tet10', 'hex20'}
+        assert reloaded.volume_cells['tet10'].shape == (1, 10)
+        assert reloaded.volume_cells['hex20'].shape == (1, 20)
+
+
+# =============================================================================
 # Test Adapter Registry
 # =============================================================================
 
