@@ -123,6 +123,9 @@ class QualityMetrics:
     statistics: Dict[str, float] = field(default_factory=dict)
     threshold: Optional[float] = None
     violation_count: int = 0
+    # Provenance tags, e.g. {'linearized': True} when quadratic cells
+    # were evaluated through their corner-only linear equivalents.
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         """Compute statistics from values array."""
@@ -162,7 +165,8 @@ class QualityMetrics:
             'statistics': self.statistics,
             'threshold': self.threshold,
             'violation_count': self.violation_count,
-            'total_count': len(self.values)
+            'total_count': len(self.values),
+            'metadata': self.metadata,
         }
 
 

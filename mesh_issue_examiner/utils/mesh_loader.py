@@ -197,10 +197,13 @@ def load_mesh_from_file(
             volume_cells=volume_cells if volume_cells else None,
         )
 
-        # Extract materials from NASTRAN if requested
+        # Extract materials from NASTRAN if requested.  NASTRAN stores
+        # material assignments in property cards (PSOLID PID->MID), not in
+        # named cell-data arrays, so material_array_name is not forwarded
+        # as a card key here; the default PSOLID mapping is used.
         if material_array_name:
             from .material_reader import extract_materials_from_nas
-            cell_mats, mat_names = extract_materials_from_nas(str(file_path), material_array_name)
+            cell_mats, mat_names = extract_materials_from_nas(str(file_path))
             if cell_mats is not None:
                 mesh_input.cell_materials = cell_mats
                 if mat_names:
@@ -382,7 +385,10 @@ def _extract_material_data(
     """Extract material assignments from a native mesh object's cell data.
 
     Tries PyVista cell_data first, then falls back to meshio-style
-    cell_data dicts.
+    cell_data dicts.  For PyVista grids the array is in *grid cell order*;
+    it is then reordered into ``volume_cells`` block order (per element
+    type, first-occurrence) so that ``cell_materials[i]`` corresponds to
+    the cell at global index ``i`` used by the multi-material operations.
 
     Args:
         mesh_input: The MeshInput to attach materials to.
@@ -399,6 +405,19 @@ def _extract_material_data(
         elif hasattr(cd, 'get') and cd.get(array_name) is not None:
             cell_materials = np.asarray(cd.get(array_name)).flatten()
 
+    # Reorder from grid cell order into volume_cells block order.  The
+    # canonical volume_cells dict groups cells by element type (in order
+    # of first occurrence in the grid), so a grid-order array only aligns
+    # when cells happen to be grouped by type.
+    if (
+        cell_materials is not None
+        and mesh_input.has_volume_cells
+        and hasattr(native_mesh, 'celltypes')
+    ):
+        cell_materials = _reorder_materials_to_block_order(
+            cell_materials, native_mesh, mesh_input
+        )
+
     # Try meshio-style cell_data (dict of dicts)
     if cell_materials is None and hasattr(native_mesh, 'cell_data_dict'):
         cdd = native_mesh.cell_data_dict
@@ -410,3 +429,51 @@ def _extract_material_data(
 
     if cell_materials is not None and len(cell_materials) > 0:
         mesh_input.cell_materials = cell_materials
+
+
+def _reorder_materials_to_block_order(
+    grid_order_materials: np.ndarray,
+    native_mesh: Any,
+    mesh_input: MeshInput,
+) -> np.ndarray:
+    """Map a grid-order per-cell array onto the volume_cells enumeration.
+
+    Mirrors the enumeration used by the PyVista adapter's
+    ``get_volume_cells``: iterate grid cells in order, keep cells whose VTK
+    type has a canonical name, and group them per element type in order of
+    first occurrence.  Returns the input unchanged when the mapping cannot
+    be established safely (mismatched counts or unknown types).
+    """
+    from .cell_types import get_vtk_type_to_name
+
+    celltypes = np.asarray(native_mesh.celltypes)
+    if len(celltypes) != len(grid_order_materials):
+        logger.debug(
+            "celltypes length %d != materials length %d; keeping grid order",
+            len(celltypes), len(grid_order_materials),
+        )
+        return grid_order_materials
+
+    vtk_to_name = get_vtk_type_to_name()
+    positions_by_type: Dict[str, List[int]] = {}
+    for i, vtk_type in enumerate(celltypes):
+        name = vtk_to_name.get(int(vtk_type))
+        if name is None:
+            continue  # not a recognized volumetric cell
+        positions_by_type.setdefault(name, []).append(i)
+
+    volume_cells = mesh_input.volume_cells
+    reordered: List[int] = []
+    for etype, connectivity in volume_cells.items():
+        positions = positions_by_type.get(etype)
+        if positions is None or len(positions) != len(connectivity):
+            # Enumeration mismatch — grid order is the best we can offer
+            logger.debug(
+                "cell type %r count mismatch (%s grid vs %d canonical); "
+                "keeping grid order",
+                etype, len(positions) if positions else 0, len(connectivity),
+            )
+            return grid_order_materials
+        reordered.extend(int(grid_order_materials[p]) for p in positions)
+
+    return np.asarray(reordered)

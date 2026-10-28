@@ -2,18 +2,21 @@
 NASTRAN BDF/NAS file parser.
 
 Parses GRID, CTRIA3, CQUAD4, CTETRA, CHEXA, and CPENTA cards from NASTRAN
-Bulk Data files and converts them to triangular surface mesh arrays
-(vertices Nx3, faces Mx3).
+bulk Data files and converts them to triangular surface mesh arrays
+(Vertices Nx3, faces Mx3).
 
 Supports:
 - Free-field format (comma-separated)
 - Short-field format (8-character fixed columns)
 - Continuation cards for multi-card entries (CHEXA, CPENTA)
 
-Volume elements are preserved in ``volume_cells`` as corner connectivity:
-CTETRA -> 'tet4', CHEXA -> 'hex8' (8 corner nodes; midside nodes of the
-20-node form are parsed but dropped), CPENTA -> 'prism6' (6 corner nodes;
-midside nodes of the 15-node form are dropped).
+Volume elements are preserved in ``volume_cells`` with their higher-order
+forms retained (2026-10-28): CTETRA -> 'tet4', CHEXA -> 'hex8' for the
+8-node form or 'hex20' for the 20-node form, CPENTA -> 'prism6' for the
+6-node form or 'prism15' for the 15-node form.  NASTRAN's midside node
+ordering (bottom ring, top ring, verticals) matches the VTK quadratic
+ordering, so the full node list maps directly onto hex20/prism15.
+Corner reduction applies only to forms with no registered element type.
 """
 
 from collections import Counter
@@ -27,11 +30,11 @@ def parse_nas(file_path: str) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndar
     """
     Parse a NASTRAN BDF/NAS file into surface mesh arrays and volumetric cells.
 
-    Volume elements (CTETRA, CHEXA, CPENTA) are decomposed into triangular
-    faces for the boundary surface, and their corner node connectivity is
-    preserved in ``volume_cells`` for volumetric analysis ('tet4', 'hex8',
-    'prism6'). Midside nodes of higher-order CHEXA/CPENTA forms are parsed
-    but not retained.
+    Volume elements (CTETRA, CHEXA, CPENTA) are decomposed into corner-based
+    triangular faces for the boundary surface (midside nodes do not change
+    face identity), while ``volume_cells`` retains the full connectivity:
+    'tet4'/'hex8'/'prism6' for linear forms and 'hex20'/'prism15' when the
+    20/15-node forms supply midside nodes.
 
     Args:
         file_path: Path to .nas or .bdf file.
@@ -108,8 +111,10 @@ def parse_nas(file_path: str) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndar
         elif keyword in ('CHEXA', 'CPENTA'):
             # Multi-card entries: gather continuation cards (first field
             # starts with '+') before parsing the node list.
-            n_corners = 8 if keyword == 'CHEXA' else 6
-            etype = 'hex8' if keyword == 'CHEXA' else 'prism6'
+            if keyword == 'CHEXA':
+                n_corners, quad_total, quad_type = 8, 20, 'hex20'
+            else:
+                n_corners, quad_total, quad_type = 6, 15, 'prism15'
             node_fields = list(fields[3:])
             while i < n_lines:
                 nxt_raw = lines[i].rstrip('\n\r')
@@ -121,9 +126,10 @@ def parse_nas(file_path: str) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndar
                     break
                 i += 1
                 node_fields.extend(nxt_fields[1:])
-            result = _parse_volume_corners(node_fields, n_corners, etype)
+            result = _parse_volume_cell(node_fields, n_corners,
+                                        quad_total, quad_type)
             if result is not None:
-                tris, cell_nodes = result
+                tris, cell_nodes, etype = result
                 volume_faces.extend(tris)
                 volume_cells_raw.setdefault(etype, []).append(cell_nodes)
 
@@ -278,19 +284,28 @@ _PRISM_TRIS = [(0, 1, 2), (3, 4, 5)]
 _PRISM_QUADS = [(0, 1, 4, 3), (1, 2, 5, 4), (2, 0, 3, 5)]
 
 
-def _parse_volume_corners(node_fields: List[str], n_corners: int,
-                          etype: str) -> tuple | None:
-    """Parse CHEXA/CPENTA node fields into corner connectivity + faces.
+def _parse_volume_cell(node_fields: List[str], n_corners: int,
+                       quad_total: int, quad_type: str) -> tuple | None:
+    """Parse CHEXA/CPENTA node fields into connectivity + corner faces.
 
     ``node_fields`` is the concatenation of the parent card's node fields
     (from field 4 on, i.e. after keyword/EID/PID) and any continuation-card
-    node fields. Continuation markers (fields starting with '+') are
-    ignored; only the first ``n_corners`` integers are kept (midside nodes
-    of the 20-node CHEXA / 15-node CPENTA forms are dropped).
+    node fields.  Continuation markers (fields starting with '+') are
+    ignored.
+
+    Higher-order forms are retained: when at least ``quad_total`` node IDs
+    are present the full node list becomes a ``quad_type`` cell (hex20 /
+    prism15); NASTRAN's midside ordering matches the VTK quadratic
+    ordering, so the connectivity needs no reordering.  Corner-only forms
+    (and forms with no registered higher-order type) keep the linear
+    hex8/prism6 connectivity.
+
+    The boundary-face decomposition is always corner-based: midside nodes
+    do not change face identity.
 
     Returns:
-        Tuple of (triangular_faces, corner_node_list) or None if fewer than
-        ``n_corners`` valid node IDs are present.
+        Tuple of (triangular_faces, node_list, element_type) or None if
+        fewer than ``n_corners`` valid node IDs are present.
     """
     nodes: List[int] = []
     for f in node_fields:
@@ -302,20 +317,27 @@ def _parse_volume_corners(node_fields: List[str], n_corners: int,
             continue
     if len(nodes) < n_corners:
         return None
+
+    if len(nodes) >= quad_total:
+        etype = quad_type
+        cell_nodes = nodes[:quad_total]
+    else:
+        etype = 'hex8' if quad_total == 20 else 'prism6'
+        cell_nodes = nodes[:n_corners]
     corners = nodes[:n_corners]
 
     tris: List[Tuple[int, int, int]] = []
-    if etype == 'hex8':
+    if n_corners == 8:
         for a, b, c, d in _HEX_QUADS:
             tris.append((corners[a], corners[b], corners[c]))
             tris.append((corners[a], corners[c], corners[d]))
-    else:  # prism6
+    else:  # wedge
         for a, b, c in _PRISM_TRIS:
             tris.append((corners[a], corners[b], corners[c]))
         for a, b, c, d in _PRISM_QUADS:
             tris.append((corners[a], corners[b], corners[c]))
             tris.append((corners[a], corners[c], corners[d]))
-    return tris, corners
+    return tris, cell_nodes, etype
 
 
 # ---------------------------------------------------------------------------

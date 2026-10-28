@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 
+import numpy as np
+
 from ..core.exceptions import MeshExaminerError
 from ..core.models import (
     MeshInput,
@@ -169,6 +171,18 @@ class MeshIssueExaminerServer:
                         'type': 'string',
                         'enum': ['trimesh', 'pyvista', 'pymeshlab'],
                         'description': 'Preferred loader. Auto-detected when omitted.'
+                    },
+                    'material_array_name': {
+                        'type': 'string',
+                        'description': (
+                            'Name of the per-cell data array holding material '
+                            'IDs (e.g. "material", "gmsh:physical", '
+                            '"region_id"). When provided, material '
+                            'assignments are extracted so multi-material '
+                            'operations (quality_3d.detect_material_interfaces, '
+                            'check_interface_quality, per_material_statistics) '
+                            'can run.'
+                        )
                     }
                 },
                 'required': ['file_path']
@@ -403,16 +417,18 @@ class MeshIssueExaminerServer:
 
         mesh_id = params.get('mesh_id')
         library = params.get('library')
+        material_array_name = params.get('material_array_name')
 
         mesh_input = load_mesh_from_file(
             resolved,
             mesh_id=mesh_id,
-            library=library
+            library=library,
+            material_array_name=material_array_name
         )
 
         self._mesh_cache[mesh_input.mesh_id] = mesh_input
 
-        return {
+        result = {
             'mesh_id': mesh_input.mesh_id,
             'n_vertices': mesh_input.n_vertices,
             'n_faces': mesh_input.n_faces,
@@ -422,6 +438,19 @@ class MeshIssueExaminerServer:
             },
             'format': mesh_input.source_format
         }
+
+        # Materials summary when extraction was requested and succeeded
+        cell_materials = mesh_input.cell_materials
+        if cell_materials is not None:
+            unique_ids = np.unique(cell_materials).tolist()
+            result['materials'] = {
+                'count': len(unique_ids),
+                'ids': unique_ids,
+                'names': mesh_input.material_names or {},
+                'n_cells_assigned': int(len(cell_materials))
+            }
+
+        return result
 
     async def _handle_inspect(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Handle mesh inspection request."""
@@ -604,6 +633,7 @@ def create_mcp_server(
         file_path: str,
         mesh_id: str | None = None,
         library: str | None = None,
+        material_array_name: str | None = None,
     ) -> str:
         """Load a mesh file for subsequent inspection operations.
 
@@ -617,22 +647,38 @@ def create_mcp_server(
             library: Preferred loading library.  One of "trimesh",
                 "pyvista", "pymeshlab".  If omitted the server picks
                 automatically.
+            material_array_name: Optional name of the per-cell data array
+                holding material IDs (e.g. "material", "gmsh:physical",
+                "region_id").  When provided, material assignments are
+                extracted so the multi-material operations
+                (quality_3d.detect_material_interfaces,
+                check_interface_quality, per_material_statistics) can run.
+                The load response then includes a materials summary.
 
         Returns:
             JSON string with mesh_id, vertex/face counts, bounding box,
-            and source format.
+            and source format (plus a materials summary when
+            material_array_name extracted data).
 
         Example:
             Load "model.stl" and then inspect it::
 
                 result = mesh_load(file_path="model.stl")
                 mesh_inspect(mesh_id=<mesh_id from result>)
+
+            Load a two-material VTU with material IDs in the "material"
+            cell-data array::
+
+                result = mesh_load(file_path="model.vtu",
+                                   material_array_name="material")
         """
         params: Dict[str, Any] = {"file_path": file_path}
         if mesh_id is not None:
             params["mesh_id"] = mesh_id
         if library is not None:
             params["library"] = library
+        if material_array_name is not None:
+            params["material_array_name"] = material_array_name
         result = await backend._handle_load(params)
         return json.dumps(result, indent=2)
 

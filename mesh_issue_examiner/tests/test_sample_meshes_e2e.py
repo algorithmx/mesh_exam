@@ -252,30 +252,35 @@ class TestDefectiveMeshes:
 # ===================================================================
 
 VOLUME_CASES = {
-    # Clean 2x2x2 hex grid: the three connectivity ops must stay silent.
-    # The legacy quality_3d ops (check_orientation_consistency,
-    # check_boundary_layer) misfire on regular hex grids, so passed is
-    # False for every volume fixture (see docs/volumetric-mesh-gaps-report.md).
+    # Clean 2x2x2 hex grid: zero issues.  The face-winding tables were
+    # normalised to the outward convention (2026-10-28) so stacked hex
+    # bottom faces no longer trip check_orientation_consistency, and the
+    # 2D surface ops are volume-aware so the interior node is not
+    # flagged as isolated/irregular/disconnected.
     "closed_volume": {
-        "expect_passed": False,
+        "expect_passed": True,
+        "expect_zero": True,
         "expect_keywords": [],
         "forbid_keywords": ["duplicate_cells", "orphaned_cells",
-                            "boundary_closure", "nonmanifold_faces"],
+                            "boundary_closure", "nonmanifold_faces",
+                            "check_orientation_consistency"],
     },
     "duplicate_cell": {
         "expect_passed": False,
         "expect_keywords": ["duplicate_cells", "boundary_closure"],
         "forbid_keywords": ["orphaned_cells"],
     },
+    # The T-junction still fires boundary_closure but at sub-failing
+    # severity, so the mesh passes since the boundary-layer recalibration.
     "leaky_volume": {
-        "expect_passed": False,
+        "expect_passed": True,
         "expect_keywords": ["boundary_closure"],
         "forbid_keywords": ["duplicate_cells", "orphaned_cells",
                             "nonmanifold_faces"],
     },
-    # Clean quadratic (tet10) volume: connectivity ops stay silent and
-    # vtkCellQuality's -1 sentinel for quadratic tets must not be read as
-    # an inverted cell.
+    # Clean quadratic (tet10) volume: connectivity ops stay silent;
+    # quality metrics come from the corner-linearised grid (Phase 4)
+    # with real values and zero violations.
     "tet10_volume": {
         "expect_passed": True,
         "expect_keywords": [],
@@ -295,7 +300,11 @@ class TestVolumeMeshes:
         server = _server()
         load, inspect, _ = await _load_inspect_get_issues(server, mesh_name, fmt="vtu")
         assert load["n_vertices"] > 0
-        assert inspect["summary"]["total_issues"] > 0
+        total = inspect["summary"]["total_issues"]
+        if VOLUME_CASES[mesh_name].get("expect_zero"):
+            assert total == 0
+        else:
+            assert total > 0
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("mesh_name", list(VOLUME_CASES))
@@ -329,6 +338,34 @@ class TestVolumeMeshes:
             f"expected quality metrics for closed_volume, "
             f"got {resp.result['metric_count']}"
         )
+
+    @pytest.mark.asyncio
+    async def test_tet10_quality_metrics_linearized(self):
+        """Phase-4: quadratic volumes get real (corner-linearised) metrics.
+
+        vtkCellQuality cannot evaluate quadratic cells, so the quality op
+        recomputes on the corner-only tet4 grid; values must surface via
+        mesh_get_quality_metrics tagged as linearised, matching the
+        corner-equivalent geometry (unit tets: volume 1/6 each).
+        """
+        server = _server()
+        load, inspect, _ = await _load_inspect_get_issues(
+            server, "tet10_volume", fmt="vtu")
+        assert inspect["passed"] is True
+        resp = await server.handle_request(MCPRequest(
+            method="mesh_get_quality_metrics",
+            params={"mesh_id": load["mesh_id"]},
+        ))
+        assert resp.error is None, f"get_quality_metrics failed: {resp.error}"
+        by_name = {m["metric_name"]: m for m in resp.result["metrics"]}
+        for name in ("scaled_jacobian", "volume", "aspect_ratio"):
+            assert name in by_name, sorted(by_name)
+            m = by_name[name]
+            assert m["metadata"].get("linearized") is True, name
+            assert m["violation_count"] == 0, name
+            assert m["total_count"] == 2, name
+        assert by_name["scaled_jacobian"]["statistics"]["min"] > 0.5
+        assert abs(by_name["volume"]["statistics"]["min"] - 1 / 6) < 1e-9
 
     @pytest.mark.asyncio
     async def test_tet10_topology_matches_tet4_corners(self):
@@ -387,21 +424,22 @@ class TestNastranMixedVolume:
 
     @pytest.mark.asyncio
     async def test_mixed_element_types_parsed(self):
-        """CTETRA/CHEXA/CPENTA map to tet4/hex8/prism6 volume cells.
+        """CTETRA/CHEXA/CPENTA map to tet4/hex20/prism6 volume cells.
 
         The fixture's CHEXA uses the 20-node form with continuation cards;
-        the parser must keep the 8 corners and drop the midside nodes
-        (18 vertices: 4 tet + 8 hex + 6 wedge corners).
+        since Phase 5 (2026-10-28) the parser retains the midside nodes as
+        hex20 (30 vertices: 4 tet + 20 hex + 6 wedge; NASTRAN midside
+        ordering matches VTK so no reordering is needed).
         """
         from mesh_issue_examiner.utils.mesh_loader import load_mesh_from_file
 
         mesh = load_mesh_from_file(_mesh_file("nas_mixed_volume", fmt="nas"))
         assert mesh.has_volume_cells
-        assert set(mesh.cell_types) == {"tet4", "hex8", "prism6"}
+        assert set(mesh.cell_types) == {"tet4", "hex20", "prism6"}
         assert mesh.volume_cells["tet4"].shape == (1, 4)
-        assert mesh.volume_cells["hex8"].shape == (1, 8)
+        assert mesh.volume_cells["hex20"].shape == (1, 20)
         assert mesh.volume_cells["prism6"].shape == (1, 6)
-        assert mesh.n_vertices == 18  # midside nodes dropped
+        assert mesh.n_vertices == 30  # midside nodes retained
         assert mesh.n_volume_cells == 3
 
     @pytest.mark.asyncio
@@ -412,7 +450,7 @@ class TestNastranMixedVolume:
         load, inspect, issues = await _load_inspect_get_issues(
             server, "nas_mixed_volume", fmt="nas")
         assert load["format"] == "nas"
-        assert load["n_vertices"] == 18
+        assert load["n_vertices"] == 30
         assert inspect["passed"] is False
 
         op_ids = {i["operation_id"] for i in issues["issues"]}
@@ -422,6 +460,200 @@ class TestNastranMixedVolume:
             assert not any(kw in oid for oid in op_ids), (
                 f"nas_mixed_volume: unexpected '{kw}' in operation IDs: {op_ids}"
             )
+
+    @pytest.mark.asyncio
+    async def test_retained_hex20_gets_linearized_quality(self):
+        """Phase 4 + 5: the retained hex20 cell receives corner-linearised
+        quality metrics (unit hex corners -> volume 1.0, no violations)."""
+        server = _server()
+        load, _, _ = await _load_inspect_get_issues(
+            server, "nas_mixed_volume", fmt="nas")
+        resp = await server.handle_request(MCPRequest(
+            method="mesh_get_quality_metrics",
+            params={"mesh_id": load["mesh_id"]},
+        ))
+        assert resp.error is None, f"get_quality_metrics failed: {resp.error}"
+        metrics = resp.result["metrics"]
+        lin = [m for m in metrics if m["metadata"].get("linearized")]
+        assert lin, [m["metric_name"] for m in metrics]
+        assert {"hex20"} <= set(lin[0]["metadata"]["linearized_types"])
+        by_name = {m["metric_name"]: m for m in metrics}
+        assert by_name["volume"]["total_count"] == 3   # tet + hex + wedge
+        assert by_name["volume"]["violation_count"] == 0
+        assert abs(by_name["volume"]["statistics"]["max"] - 1.0) < 1e-9
+
+
+# ===================================================================
+# 3d. Two-material volumetric mesh (.vtu with material cell data)
+# ===================================================================
+
+class TestTwoMaterialVolume:
+    """The two_material_volume fixture exercises the material loading path.
+
+    Requires mesh_load(..., material_array_name="material") — without it
+    the multi-material operations see no cell_materials and stay silent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_materials_loaded_and_aligned(self):
+        """cell_materials follow volume_cells block order [1, 2, 1, 2].
+
+        The generator builds a 2x2x1 hex grid with materials split along x;
+        cells are enumerated k-major then j then i, so the expected array
+        (one value per cell) is [1, 2, 1, 2].
+        """
+        import numpy as np
+        from mesh_issue_examiner.utils.mesh_loader import load_mesh_from_file
+
+        mesh = load_mesh_from_file(
+            _mesh_file("two_material_volume", fmt="vtu"),
+            material_array_name="material",
+        )
+        assert mesh.has_volume_cells
+        assert mesh.n_volume_cells == 4
+        mats = mesh.cell_materials
+        assert mats is not None
+        np.testing.assert_array_equal(mats, [1, 2, 1, 2])
+        assert mesh.has_multiple_materials()
+        assert mesh.validate_materials() == []
+
+    @pytest.mark.asyncio
+    async def test_mcp_load_returns_materials_summary(self):
+        """mesh_load with material_array_name reports the materials block."""
+        server = _server()
+        resp = await server.handle_request(MCPRequest(
+            method="mesh_load",
+            params={"file_path": _mesh_file("two_material_volume", fmt="vtu"),
+                    "material_array_name": "material"},
+        ))
+        assert resp.error is None, f"load failed: {resp.error}"
+        load = resp.result
+        assert load["materials"]["count"] == 2
+        assert load["materials"]["ids"] == [1, 2]
+        assert load["materials"]["n_cells_assigned"] == 4
+
+    @pytest.mark.asyncio
+    async def test_pipeline_reports_material_ops(self):
+        """With materials loaded, detect_material_interfaces and
+        per_material_statistics fire; connectivity ops stay silent."""
+        server = _server()
+        resp = await server.handle_request(MCPRequest(
+            method="mesh_load",
+            params={"file_path": _mesh_file("two_material_volume", fmt="vtu"),
+                    "material_array_name": "material"},
+        ))
+        assert resp.error is None
+        mesh_id = resp.result["mesh_id"]
+
+        resp = await server.handle_request(MCPRequest(
+            method="mesh_inspect", params={"mesh_id": mesh_id}))
+        assert resp.error is None
+        resp = await server.handle_request(MCPRequest(
+            method="mesh_get_issues", params={"mesh_id": mesh_id}))
+        assert resp.error is None
+        issues = resp.result
+
+        op_ids = {i["operation_id"] for i in issues["issues"]}
+        assert any("detect_material_interfaces" in oid for oid in op_ids), op_ids
+        assert any("per_material_statistics" in oid for oid in op_ids), op_ids
+        for kw in ("duplicate_cells", "orphaned_cells", "boundary_closure",
+                   "nonmanifold_faces"):
+            assert not any(kw in oid for oid in op_ids), (
+                f"two_material_volume: unexpected '{kw}' in operation IDs"
+            )
+
+    @pytest.mark.asyncio
+    async def test_without_material_array_material_ops_silent(self):
+        """Loading without material_array_name leaves cell_materials unset,
+        so the multi-material operations report nothing (backwards compat)."""
+        server = _server()
+        _, _, issues = await _load_inspect_get_issues(
+            server, "two_material_volume", fmt="vtu")
+        op_ids = {i["operation_id"] for i in issues["issues"]}
+        assert not any("material" in oid for oid in op_ids), op_ids
+
+
+# ===================================================================
+# 3e. Boundary-layer volumetric meshes (.vtu prism6 stack + tet4 cap)
+# ===================================================================
+
+class TestBoundaryLayerVolume:
+    """boundary_layer / boundary_layer_bad_growth exercise the wall-seed
+    calibration and growth-ratio detection end-to-end.
+
+    The clean stack (growth 1.15) must keep quality_3d.check_boundary_layer
+    silent; the defective stack (3x jump in layer 3) must fire it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_clean_stack_boundary_layer_op_silent(self):
+        """The calibrated BL check reports nothing on the clean stack."""
+        from mesh_issue_examiner.operations.operation_registry import registry
+        from mesh_issue_examiner.utils.mesh_loader import load_mesh_from_file
+
+        mesh = load_mesh_from_file(_mesh_file("boundary_layer", fmt="vtu"))
+        assert set(mesh.cell_types) == {"prism6", "tet4"}
+        assert mesh.n_volume_cells == 6
+
+        op = registry.get("quality_3d.check_boundary_layer")
+        issues = op.execute(mesh)
+        assert issues == [], (
+            f"clean BL stack must be silent, got: "
+            f"{[(i.operation_id, i.message) for i in issues]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_bad_growth_fires_high_severity_growth_issue(self):
+        """The 3x layer jump produces a high-severity growth_ratio issue.
+
+        Centroid-metric ratios [1.075, 2.14, 1.61, 1.15]: 2 of 4
+        transitions violate 1.2 (rate 0.5 -> ERROR severity).
+        """
+        from mesh_issue_examiner.core.models import IssueSeverity
+        from mesh_issue_examiner.operations.operation_registry import registry
+        from mesh_issue_examiner.utils.mesh_loader import load_mesh_from_file
+
+        mesh = load_mesh_from_file(
+            _mesh_file("boundary_layer_bad_growth", fmt="vtu"))
+        op = registry.get("quality_3d.check_boundary_layer")
+        issues = op.execute(mesh)
+
+        growth = [i for i in issues
+                  if i.metadata.get("check") == "growth_ratio"]
+        assert len(growth) == 1, (
+            f"expected exactly one growth_ratio issue, got "
+            f"{[(i.metadata, i.message) for i in issues]}"
+        )
+        assert growth[0].severity in (
+            IssueSeverity.CRITICAL, IssueSeverity.ERROR
+        )
+        assert growth[0].metrics["max_growth_ratio"] > 1.2
+        # Heights 0.2, 0.23, 0.69 ... -> centroid-metric ratio ~2.14
+        assert growth[0].metrics["max_growth_ratio"] > 2.0
+
+    @pytest.mark.asyncio
+    async def test_pipeline_clean_stack_bl_op_absent(self):
+        """Full MCP pipeline: the clean stack passes inspection since the
+        winding recalibration (2026-10-28) — only sub-failing 2D surface
+        warnings remain — and never shows the boundary-layer op."""
+        server = _server()
+        _, inspect, issues = await _load_inspect_get_issues(
+            server, "boundary_layer", fmt="vtu")
+        assert inspect["passed"] is True
+        op_ids = {i["operation_id"] for i in issues["issues"]}
+        assert not any("check_boundary_layer" in oid for oid in op_ids), (
+            f"boundary_layer: unexpected BL op in {op_ids}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_pipeline_bad_growth_reports_bl_op(self):
+        """Full MCP pipeline: the defective stack surfaces the BL op."""
+        server = _server()
+        _, inspect, issues = await _load_inspect_get_issues(
+            server, "boundary_layer_bad_growth", fmt="vtu")
+        assert inspect["passed"] is False
+        op_ids = {i["operation_id"] for i in issues["issues"]}
+        assert any("check_boundary_layer" in oid for oid in op_ids), op_ids
 
 
 # ===================================================================

@@ -59,12 +59,25 @@ class IsolatedVertexDetection(BaseOperation):
         if n_verts == 0:
             return []
 
-        if (n_faces := len(faces)) == 0:
-            # All vertices are isolated when there are no faces
+        # Set-difference: all vertices minus used vertices.  For volume
+        # meshes the surface faces are an extraction artifact: vertices
+        # referenced by any volume cell (e.g. interior nodes of a
+        # structured hex grid) are used geometry, not isolated junk.
+        used = set()
+        if len(faces):
+            if faces.ndim == 2:
+                used = set(faces.ravel().tolist())
+            else:
+                for face in faces:
+                    used.update(int(v) for v in face)
+        if mesh.has_volume_cells:
+            for conn in mesh.volume_cells.values():
+                used.update(np.asarray(conn).ravel().tolist())
+
+        if not used:
+            # No faces and no cells: every vertex is isolated
             isolated = set(range(n_verts))
         else:
-            # Set-difference: all vertices minus used vertices
-            used = set(faces.ravel().tolist())
             isolated = set(range(n_verts)) - used
 
         if not isolated:

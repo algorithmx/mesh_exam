@@ -43,6 +43,9 @@ from mesh_issue_examiner.operations.volumetric.orphaned_cells import (
 from mesh_issue_examiner.operations.volumetric.orientation_consistency import (
     OrientationConsistencyCheck,
 )
+from mesh_issue_examiner.operations.volumetric.volume_cell_quality import (
+    VolumeCellQualityComputation,
+)
 
 
 # ==================================================================
@@ -273,3 +276,96 @@ class TestPyramid14Degradation:
         issues = OrientationConsistencyCheck().execute(_pyramid14_mesh())
         assert isinstance(issues, list)
         assert issues == []   # single cell: no shared faces, no inversion data
+
+
+# ==================================================================
+# Corner-linearised quality metrics (Phase 4: vtkCellQuality returns
+# its -1 sentinel on quadratic cells, so quality_3d recomputes every
+# metric on the corner-only linear grid and tags the provenance)
+# ==================================================================
+
+class TestLinearizedQuality:
+    def _metrics_by_name(self, mesh):
+        op = VolumeCellQualityComputation()
+        issues = op.execute(mesh)
+        by_name = {qm.metric_name: qm for qm in op.last_quality_metrics}
+        return op, issues, by_name
+
+    def test_tet10_metrics_real_and_tagged_linearized(self):
+        """No -1 sentinels survive; every metric carries the tag."""
+        op, issues, by_name = self._metrics_by_name(_two_tet10_mesh())
+        assert issues == []   # good corner tets: no threshold violations
+        assert set(by_name) >= {"scaled_jacobian", "volume",
+                                "aspect_ratio"}
+        for name, qm in by_name.items():
+            assert not np.any(qm.values == -1.0), name
+            assert qm.metadata.get("linearized") is True, name
+            assert qm.metadata["linearized_types"] == ["tet10"]
+            assert len(qm.values) == 2   # one value per original cell
+
+    def test_tet10_matches_corner_equivalent_tet4(self):
+        """Linearised values equal the corner tet4 mesh exactly."""
+        quad = _two_tet10_mesh()
+        corner = MeshInput(
+            vertices=quad.vertices,
+            faces=np.zeros((0, 3), dtype=int),
+            mesh_id="two_tet10_corners",
+            volume_cells={"tet4": np.array([[0, 1, 2, 3], [1, 0, 2, 4]])},
+        )
+        _, _, quad_m = self._metrics_by_name(quad)
+        op4, issues4, lin_m = self._metrics_by_name(corner)
+        assert issues4 == []
+        for name, qm_quad in quad_m.items():
+            assert name in lin_m, name
+            np.testing.assert_allclose(
+                qm_quad.values, lin_m[name].values, rtol=1e-12, err_msg=name)
+        # linear mesh must not be tagged
+        assert all("linearized" not in qm.metadata for qm in lin_m.values())
+
+    def test_pyramid14_receives_linearized_metrics(self):
+        """pyramid14 (no VTK cell) gets metrics via its pyramid5 corners."""
+        op, issues, by_name = self._metrics_by_name(_pyramid14_mesh())
+        assert "scaled_jacobian" in by_name
+        qm = by_name["scaled_jacobian"]
+        assert qm.metadata.get("linearized") is True
+        assert qm.metadata["linearized_types"] == ["pyramid14"]
+        assert not np.any(qm.values == -1.0)
+        assert len(qm.values) == 1
+
+    def test_mixed_linear_quadratic_preserves_cell_count(self):
+        """hex8 block + tet10 block: one value per cell, in order."""
+        quad = _two_tet10_mesh()
+        hex_v = np.array([
+            [5, 0, 0], [6, 0, 0], [6, 1, 0], [5, 1, 0],
+            [5, 0, 1], [6, 0, 1], [6, 1, 1], [5, 1, 1],
+        ], float)
+        mesh = MeshInput(
+            vertices=np.vstack([quad.vertices, hex_v]),
+            faces=np.zeros((0, 3), dtype=int),
+            mesh_id="mixed_hex8_tet10",
+            volume_cells={
+                "hex8": np.array([[14, 15, 16, 17, 18, 19, 20, 21]]),
+                "tet10": quad.volume_cells["tet10"],
+            },
+        )
+        _, issues, by_name = self._metrics_by_name(mesh)
+        vol = by_name["volume"]
+        assert len(vol.values) == 3   # 1 hex + 2 tets
+        assert vol.metadata.get("linearized") is True
+        assert vol.metadata["linearized_types"] == ["tet10"]
+        # unit cube hex first, then the two tets (1/6 each)
+        np.testing.assert_allclose(vol.values, [1.0, 1 / 6, 1 / 6])
+
+    def test_linear_mesh_not_tagged(self):
+        mesh = MeshInput(
+            vertices=np.array([
+                [0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1],
+            ], float),
+            faces=np.zeros((0, 3), dtype=int),
+            mesh_id="single_tet4",
+            volume_cells={"tet4": np.array([[0, 1, 2, 3]])},
+        )
+        _, issues, by_name = self._metrics_by_name(mesh)
+        assert "scaled_jacobian" in by_name
+        assert all("linearized" not in qm.metadata
+                   for qm in by_name.values())

@@ -22,15 +22,26 @@ one place.
 
 from typing import Dict, List, Optional, Tuple
 
+# Recalibrated 2026-10-28: every entry now follows the outward
+# right-hand rule under VTK node ordering (verified per-face via signed
+# volumes).  The previous table mixed conventions — the hex8 bottom face,
+# prism6 bottom cap and pyramid5 base were inward-wound while the other
+# faces were outward — so vertically stacked cells listed shared faces
+# with identical directed edges and check_orientation_consistency
+# reported winding errors on perfectly regular grids.  The tet4 table
+# was uniformly inverted (harmless for the pairwise check, since every
+# face flipped together) and is normalised here as well.  Face ORDER is
+# unchanged: face 0 remains the bottom/base face (see
+# boundary_layer_quality.BASE_FACE_INDICES).
 ELEMENT_FACES: Dict[str, List[Tuple[int, ...]]] = {
     'tet4': [
-        (0, 1, 2),  # base triangle
-        (0, 2, 3),  # side triangle
-        (0, 3, 1),  # side triangle
-        (1, 3, 2),  # side triangle
+        (2, 1, 0),  # base triangle
+        (3, 2, 0),  # side triangle
+        (1, 3, 0),  # side triangle
+        (2, 3, 1),  # side triangle
     ],
     'hex8': [
-        (0, 1, 2, 3),  # bottom face
+        (3, 2, 1, 0),  # bottom face
         (4, 5, 6, 7),  # top face
         (0, 1, 5, 4),  # front face
         (1, 2, 6, 5),  # right face
@@ -38,14 +49,14 @@ ELEMENT_FACES: Dict[str, List[Tuple[int, ...]]] = {
         (3, 0, 4, 7),  # left face
     ],
     'prism6': [
-        (0, 1, 2),     # bottom triangle
+        (2, 1, 0),     # bottom triangle
         (3, 4, 5),     # top triangle
         (0, 1, 4, 3),  # side quad
         (1, 2, 5, 4),  # side quad
         (2, 0, 3, 5),  # side quad
     ],
     'pyramid5': [
-        (0, 1, 2, 3),  # base quad
+        (3, 2, 1, 0),  # base quad
         (0, 1, 4),     # side triangle
         (1, 2, 4),     # side triangle
         (2, 3, 4),     # side triangle

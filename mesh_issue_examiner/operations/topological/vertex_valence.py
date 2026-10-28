@@ -117,6 +117,26 @@ class VertexValenceDetection(BaseOperation):
         
         # Find irregular vertices
         irregular_mask = (valence < min_val) | (valence > max_val)
+
+        # Volume meshes: the surface faces are an extraction artifact,
+        # and vertices referenced only by volume cells (interior nodes)
+        # never appear in them — their surface valence of 0 is not a
+        # defect.  Exclude cell-referenced vertices absent from faces.
+        if mesh.has_volume_cells:
+            faces = mesh.faces
+            n_verts = len(mesh.vertices)
+            in_faces = np.zeros(n_verts, dtype=bool)
+            if faces.ndim == 2:
+                in_faces[faces.ravel()] = True
+            else:
+                for face in faces:
+                    in_faces[np.asarray(face, dtype=int)] = True
+            in_cells = np.zeros(n_verts, dtype=bool)
+            for conn in mesh.volume_cells.values():
+                in_cells[np.asarray(conn).ravel()] = True
+            interior = in_cells & ~in_faces
+            irregular_mask = irregular_mask & ~interior
+
         irregular_indices = np.where(irregular_mask)[0]
         
         if len(irregular_indices) == 0:

@@ -57,6 +57,18 @@ BASE_FACE_INDICES: Dict[str, List[int]] = {
 # Maximum number of IssueLocation objects per issue (prevents huge reports)
 _MAX_LOCATIONS = 100
 
+# Wall-seed calibration (2026-10-28):
+#   1. Thin-cell gate — a BL seed cell must be thin: its in-plane extent
+#      must exceed its wall-normal height by at least this factor.  Regular
+#      hex grids have near-cubic cells and must NOT be treated as boundary
+#      layers (they previously seeded on every volume fixture).
+#   2. Growth-away gate — inflation layers grow away from the wall, so the
+#      neighbour through the opposite base face must not be systematically
+#      thinner than the seed.  This rejects seeds taken from the BL's outer
+#      surface (the wrong side of the stack).
+_MIN_SEED_THIN_RATIO = 2.0
+_GROWTH_AWAY_TOLERANCE = 0.9
+
 
 class BoundaryLayerQualityCheck(BaseOperation):
     """
@@ -175,7 +187,9 @@ class BoundaryLayerQualityCheck(BaseOperation):
             self._check_orthogonality(vertices, mesh, layers)
         )
         issues.extend(
-            self._check_coverage(seed_cells, boundary_face_keys)
+            self._check_coverage(
+                seed_cells, boundary_face_keys, mesh, layers, face_to_cells
+            )
         )
 
         return issues
@@ -462,8 +476,19 @@ class BoundaryLayerQualityCheck(BaseOperation):
         self,
         seed_cells: List[dict],
         boundary_face_keys: List[Tuple[int, ...]],
+        mesh: MeshInput,
+        layers: List[List[dict]],
+        face_to_cells: Dict[Tuple[int, ...], List[dict]],
     ) -> List[MeshIssue]:
-        """Check how much of the wall surface is covered by BL cells."""
+        """Check how much of the wall surface is covered by BL cells.
+
+        Wall candidates are boundary faces that lie neither on the traced
+        BL cells themselves (their own caps and sides are the BL exterior,
+        not wall) nor on transition cells — non-BL cells sharing a face
+        with the traced stack (e.g. the tetrahedral core the BL grows
+        into).  Uncovered candidates indicate the BL wraps only part of
+        the wall.
+        """
         if not seed_cells or not boundary_face_keys:
             return []
 
@@ -473,19 +498,40 @@ class BoundaryLayerQualityCheck(BaseOperation):
             for fkey in cell_info.get('wall_face_keys', []):
                 covered_faces.add(fkey)
 
-        # "Wall" boundary faces = base-face-shaped faces on the boundary
-        # For coverage, compare against boundary faces that could be wall faces
-        # (have same vertex count as base faces: 3 for prisms, 4 for hexes/pyramids)
-        base_face_sizes = {3, 4}  # triangular and quad faces
+        # Faces of the traced BL stack
+        traced_gidx = {
+            cell['global_idx'] for layer in layers for cell in layer
+        }
+        traced_faces: Set[Tuple[int, ...]] = set()
+        transition_cells: Dict[int, str] = {}  # global_idx -> element_type
+        for layer in layers:
+            for cell_info in layer:
+                for fkey in _get_cell_faces(mesh, cell_info):
+                    traced_faces.add(fkey)
+                    for adj in face_to_cells.get(fkey, []):
+                        if adj['global_idx'] not in traced_gidx:
+                            transition_cells[adj['global_idx']] = (
+                                adj['element_type']
+                            )
+
+        # Faces belonging to transition (core) cells next to the BL
+        excluded = set(traced_faces)
+        for tc_idx, tc_type in transition_cells.items():
+            excluded.update(
+                _get_cell_faces(
+                    mesh, {'global_idx': tc_idx, 'element_type': tc_type}
+                )
+            )
+
         wall_candidate_faces = [
-            k for k in boundary_face_keys if len(k) in base_face_sizes
+            k for k in boundary_face_keys if k not in excluded
         ]
 
-        if not wall_candidate_faces:
+        if not wall_candidate_faces and not covered_faces:
             return []
 
-        covered = len(covered_faces & set(wall_candidate_faces))
-        total = len(wall_candidate_faces)
+        covered = len(covered_faces)
+        total = covered + len(wall_candidate_faces)
         coverage = covered / max(total, 1)
 
         if coverage >= 1.0:
@@ -585,6 +631,8 @@ def _identify_wall_seed_cells(
     """
     seed_cells: Dict[int, dict] = {}  # global_idx -> info
 
+    vertices = mesh.vertices
+
     for bfkey in boundary_set:
         entries = face_to_cells.get(bfkey, [])
         for entry in entries:
@@ -596,6 +644,10 @@ def _identify_wall_seed_cells(
 
             # Check if this boundary face is a base face of the cell
             if _is_base_face_of_cell(mesh, gidx, etype, bfkey):
+                if not _passes_seed_gates(
+                    mesh, vertices, face_to_cells, gidx, etype, bfkey
+                ):
+                    continue
                 if gidx not in seed_cells:
                     seed_cells[gidx] = {
                         'global_idx': gidx,
@@ -606,6 +658,78 @@ def _identify_wall_seed_cells(
                     seed_cells[gidx]['wall_face_keys'].append(bfkey)
 
     return list(seed_cells.values())
+
+
+def _passes_seed_gates(
+    mesh: MeshInput,
+    vertices: np.ndarray,
+    face_to_cells: Dict[Tuple[int, ...], List[dict]],
+    gidx: int,
+    etype: str,
+    seed_face_key: Tuple[int, ...],
+) -> bool:
+    """Apply the BL-typical calibration gates to a seed candidate.
+
+    Gate 1 (thin cell): in-plane extent / height >= ``_MIN_SEED_THIN_RATIO``.
+    Gate 2 (growth away from wall): when the cell opposite the seed face
+    through the stack is itself a BL-type cell, it must not be >10% thinner
+    than the seed (layers grow away from walls).  A missing neighbour
+    (last layer against the core, or a single-cell shell) is accepted.
+    """
+    conn = _get_cell_connectivity(mesh, etype, gidx)
+    if conn is None:
+        return False
+    cell_verts = vertices[conn]
+
+    height = _estimate_cell_height(cell_verts, etype)
+    inplane = _inplane_edge_length(cell_verts, etype)
+    if height <= 0.0 or inplane <= 0.0:
+        return False
+
+    # Gate 1: thin cell
+    if inplane / height < _MIN_SEED_THIN_RATIO:
+        return False
+
+    # Gate 2: growth away from the seeded face
+    opposite_key = _opposite_base_face_key(mesh, conn, etype, seed_face_key)
+    if opposite_key is not None:
+        for adj in face_to_cells.get(opposite_key, []):
+            if adj['global_idx'] == gidx:
+                continue
+            if adj['element_type'] not in BL_ELEMENT_TYPES:
+                break  # transition into the core mesh — acceptable
+            adj_conn = _get_cell_connectivity(
+                mesh, adj['element_type'], adj['global_idx']
+            )
+            if adj_conn is None:
+                break
+            adj_height = _estimate_cell_height(
+                vertices[adj_conn], adj['element_type']
+            )
+            if adj_height > 0 and adj_height < _GROWTH_AWAY_TOLERANCE * height:
+                return False  # stack thins toward the seed face — wrong side
+            break
+
+    return True
+
+
+def _opposite_base_face_key(
+    mesh: MeshInput,
+    conn: np.ndarray,
+    element_type: str,
+    seed_face_key: Tuple[int, ...],
+) -> Optional[Tuple[int, ...]]:
+    """Return the base face key on the opposite side of the cell."""
+    base_indices = BASE_FACE_INDICES.get(element_type) or []
+    face_defs = ELEMENT_FACES[element_type]
+    for idx in base_indices:
+        if idx >= len(face_defs):
+            continue
+        face_verts = tuple(int(conn[i]) for i in face_defs[idx])
+        key = tuple(sorted(face_verts))
+        if key != seed_face_key:
+            return key
+    return None
 
 
 def _is_base_face_of_cell(
@@ -825,6 +949,39 @@ def _estimate_cell_height(
         return float(np.max(pdist(cell_verts)))
 
 
+def _inplane_edge_length(
+    cell_verts: np.ndarray, element_type: str
+) -> float:
+    """Estimate the mean in-plane (wall-parallel) edge length of a BL cell.
+
+    For prism6: mean bottom-triangle edge length (verts 0-2).
+    For hex8: mean bottom-quad edge length (verts 0-3).
+    Other types: median pairwise vertex distance (fallback).
+    """
+    if element_type == 'prism6' and len(cell_verts) == 6:
+        bottom = cell_verts[:3]
+        edges = [
+            np.linalg.norm(bottom[1] - bottom[0]),
+            np.linalg.norm(bottom[2] - bottom[1]),
+            np.linalg.norm(bottom[0] - bottom[2]),
+        ]
+        return float(np.mean(edges))
+    elif element_type == 'hex8' and len(cell_verts) == 8:
+        bottom = cell_verts[:4]
+        edges = [
+            np.linalg.norm(bottom[1] - bottom[0]),
+            np.linalg.norm(bottom[2] - bottom[1]),
+            np.linalg.norm(bottom[3] - bottom[2]),
+            np.linalg.norm(bottom[0] - bottom[3]),
+        ]
+        return float(np.mean(edges))
+    else:
+        from scipy.spatial.distance import pdist
+        if len(cell_verts) < 2:
+            return 0.0
+        return float(np.median(pdist(cell_verts)))
+
+
 def _compute_cell_aspect_ratio(
     cell_verts: np.ndarray, element_type: str
 ) -> float:
@@ -836,29 +993,7 @@ def _compute_cell_aspect_ratio(
     if height <= 0:
         return 0.0
 
-    if element_type == 'prism6' and len(cell_verts) == 6:
-        bottom = cell_verts[:3]
-        edges = [
-            np.linalg.norm(bottom[1] - bottom[0]),
-            np.linalg.norm(bottom[2] - bottom[1]),
-            np.linalg.norm(bottom[0] - bottom[2]),
-        ]
-        inplane = float(np.mean(edges))
-    elif element_type == 'hex8' and len(cell_verts) == 8:
-        bottom = cell_verts[:4]
-        edges = [
-            np.linalg.norm(bottom[1] - bottom[0]),
-            np.linalg.norm(bottom[2] - bottom[1]),
-            np.linalg.norm(bottom[3] - bottom[2]),
-            np.linalg.norm(bottom[0] - bottom[3]),
-        ]
-        inplane = float(np.mean(edges))
-    else:
-        from scipy.spatial.distance import pdist
-        dists = pdist(cell_verts)
-        if len(dists) == 0:
-            return 0.0
-        inplane = float(np.median(dists))
+    inplane = _inplane_edge_length(cell_verts, element_type)
 
     return height / inplane if inplane > 0 else 0.0
 

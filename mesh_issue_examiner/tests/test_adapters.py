@@ -167,6 +167,62 @@ class TestPyVistaGetFacesMalformedInput:
         np.testing.assert_array_equal(mesh.faces, original)
 
 
+class TestPyVistaMixedVolumeSurface:
+    """Volume grids with mixed cell types must yield triangulable faces.
+
+    Regression (2026-10-28): a wedge+tet grid's extracted surface mixes
+    triangles and quads, which get_faces returns as a ragged object
+    array.  to_canonical must fan-triangulate it so the canonical
+    MeshInput.faces stays a dense (M, 3) array the 2D operations can
+    index; previously the object array crashed e.g.
+    topology.detect_isolated_vertices (unhashable ndarray).
+    """
+
+    def test_mixed_volume_surface_triangulated(self):
+        pytest.importorskip("pyvista")
+        import pyvista as pv
+
+        adapter = PyVistaAdapter()
+        # One wedge + one tet sharing the wedge's top triangle.
+        vertices = np.array([
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 0.866, 0.0],
+            [0.0, 0.0, 0.2], [1.0, 0.0, 0.2], [0.5, 0.866, 0.2],
+            [0.5, 0.288, 0.7],
+        ])
+        cells = np.array([6, 0, 1, 2, 3, 4, 5, 4, 5, 4, 3, 6])
+        celltypes = np.array([13, 10])  # VTK_WEDGE, VTK_TETRA
+        grid = pv.UnstructuredGrid(cells, celltypes, vertices)
+
+        mi = adapter.to_canonical(grid, mesh_id="wedge_tet")
+
+        assert mi.has_volume_cells
+        assert set(mi.volume_cells) == {"prism6", "tet4"}
+        # Surface: wedge bottom tri + 3 side quads (-> 6 tris) + 3 tet
+        # faces = 10 triangles, dense (M, 3) and integer-typed.
+        assert mi.faces.ndim == 2
+        assert mi.faces.shape == (10, 3)
+        assert np.issubdtype(mi.faces.dtype, np.integer)
+
+    def test_uniform_quad_surface_left_alone(self):
+        """Uniform quad surfaces (hex grids) must stay Nx4, not be split."""
+        pytest.importorskip("pyvista")
+        import pyvista as pv
+
+        adapter = PyVistaAdapter()
+        vertices = np.array([
+            [0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
+            [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1],
+        ], float)
+        cells = np.array([8, 0, 1, 2, 3, 4, 5, 6, 7])
+        grid = pv.UnstructuredGrid(
+            cells, np.array([12]), vertices)  # VTK_HEXAHEDRON
+
+        mi = adapter.to_canonical(grid, mesh_id="single_hex")
+
+        assert mi.faces.ndim == 2
+        assert mi.faces.shape == (6, 4)
+
+
 # ---------------------------------------------------------------------------
 # PyVistaAdapter.create_mesh → get_faces round-trip
 # ---------------------------------------------------------------------------

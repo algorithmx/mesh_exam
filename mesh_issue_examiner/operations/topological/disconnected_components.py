@@ -107,6 +107,17 @@ class DisconnectedComponentDetection(BaseOperation):
                 for i in range(n):
                     union(int(face[i]), int(face[(i + 1) % n]))
 
+        # Volume meshes: each cell is internally connected, so union its
+        # vertices.  The extracted surface omits interior nodes (they
+        # would otherwise register as singleton components), and cell
+        # adjacency glues neighbouring surface patches together.
+        if mesh.has_volume_cells:
+            for conn in mesh.volume_cells.values():
+                for row in np.asarray(conn):
+                    root = int(row[0])
+                    for v in row[1:]:
+                        union(root, int(v))
+
         # Count components and group vertices
         roots = np.array([find(v) for v in range(n_verts)])
         unique_roots, counts = np.unique(roots, return_counts=True)

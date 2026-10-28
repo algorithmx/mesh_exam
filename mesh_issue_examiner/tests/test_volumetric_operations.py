@@ -595,13 +595,13 @@ class TestOrientationConsistencyCheck:
             [0, 0, 2], [1, 0, 2], [0.5, 0.866, 2],
         ], dtype=float)
         faces = np.array([[0, 1, 2]])
-        # prism1 top face = local (3,4,5) = global (3,4,5)
-        # prism2 bottom face = local (0,1,2) = global (3,4,5) — same winding!
-        # For consistent winding, we need the shared face to appear reversed.
-        # prism1: face (3,4,5). prism2: face (3,4,5) → same → inconsistent
+        # Outward-wound tables (2026-10-28): prism1 top face is
+        # local (3,4,5) = global (3,4,5); prism2's bottom tuple is
+        # local (2,1,0), so the natural vertex order [3,4,5,...] lists
+        # the shared face reversed — the natural stacking is consistent.
         volume_cells = {'prism6': np.array([
             [0, 1, 2, 3, 4, 5],
-            [3, 5, 4, 6, 8, 7],  # reversed winding on shared face
+            [3, 4, 5, 6, 7, 8],  # natural order opposes prism1's top face
         ])}
         mesh = MeshInput(
             vertices=vertices, faces=faces,
@@ -653,11 +653,12 @@ class TestOrientationConsistencyCheck:
             [0.5, 0.288, 2],
         ], dtype=float)
         faces = np.array([[0, 1, 2]])
-        # Prism top face = local (3,4,5) = global (3,4,5)
-        # Tet base face = local (0,1,2) but we want global (3,5,4) to reverse (3,4,5)
+        # Outward-wound tables (2026-10-28): prism top face is local
+        # (3,4,5) = global (3,4,5); the tet's base tuple is local
+        # (2,1,0), so the natural order [3,4,5,apex] opposes it.
         volume_cells = {
             'prism6': np.array([[0, 1, 2, 3, 4, 5]]),
-            'tet4': np.array([[3, 5, 4, 6]]),  # reversed face (3,4,5)→(3,5,4)
+            'tet4': np.array([[3, 4, 5, 6]]),  # natural order opposes the top face
         }
         mesh = MeshInput(
             vertices=vertices, faces=faces,
@@ -679,10 +680,11 @@ class TestOrientationConsistencyCheck:
             [0.5, 0.288, 2],
         ], dtype=float)
         faces = np.array([[0, 1, 2]])
-        # Both present face (3,4,5) with same order → inconsistent
+        # Tet base tuple (2,1,0) makes [3,5,4,apex] list the shared
+        # face with the SAME directed edges as the prism's top face.
         volume_cells = {
             'prism6': np.array([[0, 1, 2, 3, 4, 5]]),
-            'tet4': np.array([[3, 4, 5, 6]]),
+            'tet4': np.array([[3, 5, 4, 6]]),
         }
         mesh = MeshInput(
             vertices=vertices, faces=faces,

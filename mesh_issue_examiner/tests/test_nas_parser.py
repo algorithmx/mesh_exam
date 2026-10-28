@@ -48,15 +48,23 @@ ENDDATA
 
 
 class TestChexaParsing:
-    def test_free_field_20_node_chexa_keeps_corners(self, tmp_path):
-        """20-node CHEXA: only the 8 corner nodes reach volume_cells."""
+    def test_free_field_20_node_chexa_retained_as_hex20(self, tmp_path):
+        """20-node CHEXA: all 20 nodes reach volume_cells as hex20.
+
+        Recalibrated 2026-10-28 (Phase 5): midside nodes are retained —
+        NASTRAN's midside ordering (bottom ring, top ring, verticals)
+        matches VTK's QUADRATIC_HEXAHEDRON ordering, so the row maps
+        straight through.  Boundary faces stay corner-based.
+        """
         v, f, vc = parse_nas(_write(tmp_path, FREE_FIELD_CHEXA20))
-        assert set(vc.keys()) == {"hex8"}
-        assert vc["hex8"].shape == (1, 8)
-        # Midside nodes 9-20 unused -> vertices remapped to the 8 corners.
-        assert len(v) == 8
-        np.testing.assert_array_equal(vc["hex8"][0], [0, 1, 2, 3, 4, 5, 6, 7])
-        # 6 quad faces -> 12 boundary triangles
+        assert set(vc.keys()) == {"hex20"}
+        assert vc["hex20"].shape == (1, 20)
+        # All 20 GRID nodes used (sorted ids 1..20 -> indices 0..19).
+        assert len(v) == 20
+        np.testing.assert_array_equal(
+            vc["hex20"][0], list(range(20)))
+        # 6 corner quad faces -> 12 boundary triangles (midside nodes
+        # do not change face identity)
         assert f.shape == (12, 3)
 
     def test_short_field_chexa8_with_continuation(self, tmp_path):
@@ -129,7 +137,50 @@ class TestCpentaParsing:
         # 2 triangle caps + 3 quads -> 2 + 6 = 8 boundary faces
         assert f.shape == (8, 3)
 
-    def test_cpenta15_midside_dropped(self, tmp_path):
+    def test_cpenta15_midside_retained_as_prism15(self, tmp_path):
+        """15-node CPENTA: full connectivity retained as prism15.
+
+        Recalibrated 2026-10-28 (Phase 5): NASTRAN midside ordering
+        (bottom edges, top edges, verticals) matches VTK's
+        QUADRATIC_WEDGE ordering; boundary faces stay corner-based.
+        """
+        deck = (
+            "BEGIN BULK\n"
+            "GRID,1,0,0.0,0.0,0.0\n"
+            "GRID,2,0,1.0,0.0,0.0\n"
+            "GRID,3,0,0.5,1.0,0.0\n"
+            "GRID,4,0,0.0,0.0,1.0\n"
+            "GRID,5,0,1.0,0.0,1.0\n"
+            "GRID,6,0,0.5,1.0,1.0\n"
+            # bottom edges (1-2),(2-3),(3-1)
+            "GRID,7,0,0.5,0.0,0.0\n"
+            "GRID,8,0,0.75,0.5,0.0\n"
+            "GRID,9,0,0.25,0.5,0.0\n"
+            # top edges (4-5),(5-6),(6-4)
+            "GRID,10,0,0.5,0.0,1.0\n"
+            "GRID,11,0,0.75,0.5,1.0\n"
+            "GRID,12,0,0.25,0.5,1.0\n"
+            # verticals (1-4),(2-5),(3-6)
+            "GRID,13,0,0.0,0.0,0.5\n"
+            "GRID,14,0,1.0,0.0,0.5\n"
+            "GRID,15,0,0.5,1.0,0.5\n"
+            "CPENTA,1,100,1,2,3,4,5,+P1\n"
+            "+P1,6,7,8,9,10,11,+P2\n"
+            "+P2,12,13,14,15\n"
+            "ENDDATA\n"
+        )
+        v, f, vc = parse_nas(_write(tmp_path, deck))
+        assert set(vc.keys()) == {"prism15"}
+        assert vc["prism15"].shape == (1, 15)
+        assert len(v) == 15
+        np.testing.assert_array_equal(
+            vc["prism15"][0], list(range(15)))
+        # 2 corner caps + 3 corner quads -> 8 boundary triangles
+        assert f.shape == (8, 3)
+
+    def test_partial_midside_form_falls_back_to_corners(self, tmp_path):
+        """A CPENTA listing only some midside nodes (no registered
+        9-node type) reduces to the prism6 corner connectivity."""
         deck = (
             "BEGIN BULK\n"
             "GRID,1,0,0.0,0.0,0.0\n"
@@ -147,7 +198,7 @@ class TestCpentaParsing:
         )
         v, f, vc = parse_nas(_write(tmp_path, deck))
         assert set(vc.keys()) == {"prism6"}
-        assert len(v) == 6  # midside nodes dropped
+        assert len(v) == 6  # unlisted-in-cells midside nodes dropped
 
 
 class TestMixedDeck:

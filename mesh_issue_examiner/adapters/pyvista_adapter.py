@@ -18,6 +18,25 @@ from .exceptions import QualityMetricError, FileIOError, MeshConversionError
 logger = logging.getLogger(__name__)
 
 
+def _fan_triangulate(face_arrays: np.ndarray) -> np.ndarray:
+    """Fan-triangulate a ragged (dtype=object) face array into (M, 3).
+
+    Volume-grid surface extraction can yield mixed polygon sizes (e.g.
+    wedge caps are triangles while side faces are quads).  The canonical
+    ``MeshInput.faces`` contract is a dense 2D array the triangle-oriented
+    2D operations can index directly, so each polygon with n > 3 vertices
+    is split into n - 2 triangles fanned from its first vertex.
+    """
+    tris = []
+    for face in face_arrays:
+        face = np.asarray(face)
+        for k in range(1, len(face) - 1):
+            tris.append([face[0], face[k], face[k + 1]])
+    if not tris:
+        return np.array([])
+    return np.array(tris, dtype=np.int64)
+
+
 class PyVistaAdapter(MeshAdapter):
     """
     Adapter for the PyVista library (VTK wrapper).
@@ -281,6 +300,8 @@ class PyVistaAdapter(MeshAdapter):
             surf = mesh.extract_surface(algorithm='dataset_surface')
             if surf.n_cells > 0:
                 faces = self.get_faces(surf)
+                if isinstance(faces, np.ndarray) and faces.dtype == object:
+                    faces = _fan_triangulate(faces)
 
         # Extract volume cells
         volume_cells = self.get_volume_cells(mesh)

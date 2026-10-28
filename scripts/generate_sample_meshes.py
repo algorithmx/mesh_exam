@@ -329,6 +329,39 @@ def t_junction_volume() -> tuple[np.ndarray, np.ndarray]:
     return vertices, cells
 
 
+def prism_stack(heights: list[float]) -> tuple[np.ndarray, dict]:
+    """Single-column prism boundary layer capped by a tetrahedron.
+
+    Equilateral wall triangle of side 1 at z=0; prism layer i spans
+    z_i..z_{i+1} with z_i = sum(heights[:i]).  The top triangle is capped
+    with a tet4 whose apex sits above the stack, modelling the BL-to-core
+    transition so only the wall triangle can seed layer 0.
+
+    Returns (vertices, {'prism6': (n, 6), 'tet4': (1, 4)}) with VTK wedge
+    ordering (bottom triangle then top triangle) and the cap listing the
+    shared triangle in natural order, which opposes the prism's top
+    face under the outward-wound face tables (2026-10-28).
+    """
+    tri = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 0.866, 0.0]])
+    verts = list(tri)
+    prisms = []
+    z = 0.0
+    for i, h in enumerate(heights):
+        base, top = i * 3, i * 3 + 3
+        t = tri.copy()
+        t[:, 2] = z + h
+        verts.extend(t)
+        prisms.append([base, base + 1, base + 2, top, top + 1, top + 2])
+        z += h
+    top_tri = len(heights) * 3
+    apex = len(verts)
+    verts.append([0.5, 0.288, z + 0.5])
+    return np.array(verts, float), {
+        "prism6": np.array(prisms),
+        "tet4": np.array([[top_tri, top_tri + 1, top_tri + 2, apex]]),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Fixture table
 # ---------------------------------------------------------------------------
@@ -339,6 +372,8 @@ def t_junction_volume() -> tuple[np.ndarray, np.ndarray]:
 #   no_keywords: substrings that must NOT appear in any operation_id
 #   boundary: True -> >=1 boundary issue; False -> 0 boundary issues
 #   min_issues / min_warnings: lower bounds on counts
+#   material_array: cell-data array name passed to mesh_load so the
+#                   multi-material operations receive cell_materials
 CONTRACTS = {
     # PERFECT: zero issues, passed=True
     "perfect_cube_surface": {"passed": True, "zero": True},
@@ -375,37 +410,70 @@ CONTRACTS = {
     "perfect_square": {"boundary": True},
     # CLOSED (only the no-boundary rule is asserted by the tests)
     "shell_structure": {"boundary": False},
-    # VOLUMETRIC (.vtu hex8) — the topology_3d connectivity ops.  The
-    # legacy quality_3d ops (check_orientation_consistency,
-    # check_boundary_layer) are miscalibrated for regular hex grids and
-    # fire on every volume fixture, so even the clean volume is expected
-    # to fail inspection; the contracts pin only the connectivity ops.
-    "closed_volume": {"passed": False,
+    # VOLUMETRIC (.vtu hex8) — the topology_3d connectivity ops stay
+    # silent.  check_boundary_layer was recalibrated (2026-10-28) and no
+    # longer fires on regular hex grids, and the face-winding tables
+    # were normalised to the outward convention the same day, so the
+    # clean 2x2x2 volume now passes inspection with zero issues: no
+    # winding misfires on stacked hex bottom faces, interior nodes are
+    # recognised by the volume-aware 2D ops.
+    "closed_volume": {"passed": True, "zero": True,
                       "no_keywords": ["duplicate_cells", "orphaned_cells",
-                                      "boundary_closure", "nonmanifold_faces"]},
+                                      "boundary_closure", "nonmanifold_faces",
+                                      "check_orientation_consistency"]},
     "duplicate_cell": {"passed": False,
                        "keywords": ["duplicate_cells", "boundary_closure"],
                        "no_keywords": ["orphaned_cells"]},
-    "leaky_volume": {"passed": False, "keywords": ["boundary_closure"],
+    # After the boundary-layer recalibration (2026-10-28) the T-junction
+    # volume passes inspection: boundary_closure still fires but only at
+    # sub-failing severity.
+    "leaky_volume": {"passed": True, "keywords": ["boundary_closure"],
                      "no_keywords": ["duplicate_cells", "orphaned_cells",
                                      "nonmanifold_faces"]},
-    # Quadratic volume: clean two-tet10 mesh.  vtkCellQuality cannot
-    # evaluate quadratic tets (returns its -1 sentinel), so the inverted-
-    # cell check must stay silent too (sentinel is filtered, not read as
-    # a negative volume).
+    # Quadratic volume: clean two-tet10 mesh.  Quality metrics come
+    # from the corner-linearised grid (Phase 4): real values, zero
+    # violations, and the vtkCellQuality -1 sentinel never surfaces.
     "tet10_volume": {"passed": True,
                      "no_keywords": ["duplicate_cells", "orphaned_cells",
                                      "boundary_closure", "nonmanifold_faces",
                                      "check_orientation_consistency"]},
-    # NASTRAN mixed deck (CTETRA + CHEXA20 -> hex8 corners + CPENTA6 ->
-    # prism6).  Three disjoint cells by construction, so the 2D surface
-    # ops fire (disconnected components, valence at cube corners, surface
-    # orientation noise) but the volumetric connectivity ops stay silent.
+    # NASTRAN mixed deck (CTETRA + CHEXA20 -> hex20 with midside nodes
+    # retained + CPENTA6 -> prism6; Phase 5, 2026-10-28).  Three disjoint
+    # cells by construction, so the 2D surface ops fire (disconnected
+    # components, valence at cube corners, surface orientation noise)
+    # but the volumetric connectivity ops stay silent.
     "nas_mixed_volume": {"passed": False,
                          "keywords": ["disconnected"],
                          "no_keywords": ["duplicate_cells", "orphaned_cells",
                                          "boundary_closure", "nonmanifold_faces",
                                          "check_orientation_consistency"]},
+    # Two-material hex volume: materials 1/2 split the 2x2x1 grid along x.
+    # Loaded with material_array_name="material" so detect_material_interfaces
+    # and per_material_statistics fire (INFO-level); connectivity ops silent.
+    # Passes inspection since the boundary-layer recalibration (2026-10-28).
+    "two_material_volume": {"passed": True,
+                             "material_array": "material",
+                             "keywords": ["material"],
+                             "no_keywords": ["duplicate_cells", "orphaned_cells",
+                                             "boundary_closure",
+                                             "nonmanifold_faces"]},
+    # Boundary-layer volumes (prism6 stack + tet4 cap).  The clean stack
+    # (growth 1.15) keeps quality_3d.check_boundary_layer silent and,
+    # since the winding recalibration (2026-10-28), passes inspection:
+    # only sub-failing 2D surface-op warnings remain (mixed tri/quad fan
+    # orientation noise, cap-valence).  The defective one (3x jump) must
+    # fire check_boundary_layer at ERROR and fails inspection.
+    "boundary_layer": {"passed": True,
+                       "no_keywords": ["boundary_layer", "duplicate_cells",
+                                       "orphaned_cells", "boundary_closure",
+                                       "nonmanifold_faces",
+                                       "check_orientation_consistency"]},
+    "boundary_layer_bad_growth": {"passed": False,
+                                  "keywords": ["boundary_layer"],
+                                  "no_keywords": ["duplicate_cells",
+                                                  "orphaned_cells",
+                                                  "boundary_closure",
+                                                  "nonmanifold_faces"]},
 }
 
 
@@ -489,8 +557,13 @@ def write_isolated_vertices_vtk(path: Path) -> None:
 
 
 def write_volume_vtu(path: Path, vertices, cells,
-                     element_type: str = "hex8") -> None:
-    """Save a volume mesh as VTK unstructured grid (.vtu)."""
+                     element_type: str = "hex8",
+                     cell_data: dict | None = None) -> None:
+    """Save a volume mesh as VTK unstructured grid (.vtu).
+
+    ``cell_data`` optionally maps array names to one value per cell
+    (e.g. material IDs), stored as VTK cell data.
+    """
     import pyvista as pv
 
     sys.path.insert(0, str(REPO_ROOT))
@@ -504,6 +577,44 @@ def write_volume_vtu(path: Path, vertices, cells,
     grid = pv.UnstructuredGrid(
         cells_vtk,
         np.full(len(cells), cell_type),
+        np.asarray(vertices, float),
+    )
+    if cell_data:
+        for name, values in cell_data.items():
+            grid.cell_data[name] = np.asarray(values)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    grid.save(str(path))
+
+
+def write_mixed_volume_vtu(path: Path, vertices,
+                            cells_by_type: dict) -> None:
+    """Save a mixed-element volume mesh as VTK unstructured grid (.vtu).
+
+    ``cells_by_type`` maps element type names to (n, nodes) arrays; cells
+    are written grouped by type in dict order (prisms first, then caps).
+    """
+    import pyvista as pv
+
+    sys.path.insert(0, str(REPO_ROOT))
+    from mesh_issue_examiner.utils.cell_types import (
+        ELEMENT_NODE_COUNT, get_cell_type_map,
+    )
+
+    type_map = get_cell_type_map()
+    parts, types = [], []
+    for etype, cells in cells_by_type.items():
+        n_nodes = ELEMENT_NODE_COUNT[etype]
+        cells = np.asarray(cells)
+        assert cells.shape[1] == n_nodes, (
+            f"{etype}: expected {n_nodes} nodes per cell"
+        )
+        parts.append(
+            np.hstack([np.full((len(cells), 1), n_nodes), cells]).ravel()
+        )
+        types.append(np.full(len(cells), type_map[etype]))
+    grid = pv.UnstructuredGrid(
+        np.concatenate(parts),
+        np.concatenate(types),
         np.asarray(vertices, float),
     )
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -522,8 +633,38 @@ def build_volume_fixtures() -> dict:
     }
 
 
+def build_material_fixtures() -> dict:
+    """name -> (vertices, cells, element type, cell_data) for .vtu fixtures
+    carrying per-cell data arrays (materials)."""
+    v, c = hex_grid(2, 2, 1)
+    # Cells are enumerated k-major, then j, then i: the x-half of each
+    # cell determines its material -> [1, 2, 1, 2].  The two interface
+    # faces at x=1 are conforming (shared vertices), so the mesh is a
+    # clean watertight 2x2x1 block.
+    materials = [1 + (i % 2) for i in range(len(c))]
+    return {
+        "two_material_volume": (v, c, "hex8", {"material": materials}),
+    }
+
+
+# Boundary-layer fixtures: single prism column on a unit equilateral wall
+# triangle, capped with a tet.  Heights chosen so centroid-metric growth
+# ratios (layer spacing = (h_i + h_{i+1}) / 2) stay under the 1.2 threshold
+# for the clean fixture and blow past it (3x jump) for the defective one.
+BL_LAYER_HEIGHTS = [0.2, 0.23, 0.2645, 0.3042, 0.3498]      # r = 1.15
+BL_BAD_HEIGHTS = [0.2, 0.23, 0.69, 0.7935, 0.9125]          # 3x jump
+
+
+def build_boundary_layer_fixtures() -> dict:
+    """name -> (vertices, cells_by_type) for mixed-element .vtu fixtures."""
+    return {
+        "boundary_layer": prism_stack(BL_LAYER_HEIGHTS),
+        "boundary_layer_bad_growth": prism_stack(BL_BAD_HEIGHTS),
+    }
+
+
 NAS_MIXED_DECK = """$ NASTRAN mixed volumetric fixture: CTETRA + CHEXA(20-node form,
-$ midside nodes parsed but dropped -> hex8) + CPENTA(6-node -> prism6).
+$ midside nodes retained -> hex20) + CPENTA(6-node -> prism6).
 BEGIN BULK
 GRID,1,0,0.0,0.0,0.0
 GRID,2,0,1.0,0.0,0.0
@@ -600,6 +741,18 @@ def generate(force: bool = False) -> list:
             continue
         write_volume_vtu(p, v, c, etype)
         written.append(p)
+    for name, (v, c, etype, cdata) in build_material_fixtures().items():
+        p = SAMPLE_DIR / name / f"{name}.vtu"
+        if p.exists() and not force:
+            continue
+        write_volume_vtu(p, v, c, etype, cell_data=cdata)
+        written.append(p)
+    for name, (v, cells_by_type) in build_boundary_layer_fixtures().items():
+        p = SAMPLE_DIR / name / f"{name}.vtu"
+        if p.exists() and not force:
+            continue
+        write_mixed_volume_vtu(p, v, cells_by_type)
+        written.append(p)
     nas_path = SAMPLE_DIR / "nas_mixed_volume" / "nas_mixed_volume.nas"
     if not (nas_path.exists() and not force):
         write_nas_mixed_volume(nas_path)
@@ -618,15 +771,20 @@ async def verify() -> int:
     server = MeshIssueExaminerServer(auto_register_operations=True)
     failures = 0
 
-    async def inspect(path: Path):
+    async def inspect(path: Path, material_array: str | None = None):
+        load_params: dict = {"file_path": str(path)}
+        if material_array:
+            load_params["material_array_name"] = material_array
         r = await server.handle_request(MCPRequest(method="mesh_load",
-                                                   params={"file_path": str(path)}))
+                                                   params=load_params))
         assert r.error is None, f"load failed for {path.name}: {r.error}"
         mid = r.result["mesh_id"]
         ri = await server.handle_request(MCPRequest(method="mesh_inspect",
                                                     params={"mesh_id": mid}))
+        assert ri.error is None, f"inspect failed for {path.name}: {ri.error}"
         r2 = await server.handle_request(MCPRequest(method="mesh_get_issues",
                                                     params={"mesh_id": mid}))
+        assert r2.error is None, f"get_issues failed for {path.name}: {r2.error}"
         return ri.result, r2.result
 
     for name, contract in CONTRACTS.items():
@@ -644,7 +802,7 @@ async def verify() -> int:
             failures += 1
             continue
         try:
-            insp, iss = await inspect(path)
+            insp, iss = await inspect(path, contract.get("material_array"))
         except AssertionError as exc:
             print(f"FAIL {name}: {exc}")
             failures += 1

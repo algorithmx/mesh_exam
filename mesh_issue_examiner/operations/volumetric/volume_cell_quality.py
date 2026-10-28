@@ -33,6 +33,7 @@ from ...core.models import (
 from ..base import BaseOperation, OperationMetadata
 from ..operation_registry import registry
 from ...adapters.exceptions import MeshConversionError
+from ._face_tables import ELEMENT_CORNER_COUNT, LINEAR_BASE_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +51,42 @@ EXTENDED_QUALITY_TYPES = [
     # 'min_dihedral_angle', 'max_dihedral_angle',
 ]
 
-# Quadratic element types whose VTK equivalents support quality
-# computation (corner-first node ordering; pyramid14 has no VTK cell).
-_QUAD_VTK = ['tet10', 'hex20', 'hex27', 'prism15', 'wedge18', 'pyramid13']
+# Quadratic element types.  vtkCellQuality cannot evaluate them
+# directly (it returns its -1 sentinel), so quality is computed on the
+# corner-only linear equivalents (see _linearized_volume_cells);
+# pyramid14 has no VTK cell at all and reaches the same path through
+# its pyramid5 corners.
+_QUAD_VTK = ['tet10', 'hex20', 'hex27', 'prism15', 'wedge18',
+             'pyramid13', 'pyramid14']
+
+
+def _linearized_volume_cells(mesh: 'MeshInput') -> Optional[Dict[str, 'np.ndarray']]:
+    """Return corner-only linear ``volume_cells`` for a mesh, or None.
+
+    Quadratic rows are truncated to their corner nodes (VTK node ordering
+    places corners first) and re-keyed by their linear base type
+    (:data:`LINEAR_BASE_TYPE`); linear blocks pass through unchanged so
+    the global cell ordering matches the original mesh exactly.
+
+    Returns None when the mesh contains no quadratic element types.
+    """
+    if not any(etype in LINEAR_BASE_TYPE for etype in mesh.volume_cells):
+        return None
+
+    linearized: Dict[str, np.ndarray] = {}
+    for etype, connectivity in mesh.volume_cells.items():
+        base = LINEAR_BASE_TYPE.get(etype, etype)
+        n_corner = ELEMENT_CORNER_COUNT.get(base)
+        if n_corner is None:
+            # Unknown type: pass through and let the converter decide.
+            linearized[etype] = connectivity
+            continue
+        conn = np.asarray(connectivity)
+        if conn.shape[1] == n_corner:
+            linearized[base] = conn
+        else:
+            linearized[base] = conn[:, :n_corner]
+    return linearized
 
 # Element-specific metric applicability
 # Maps metric name to list of element types that support it
@@ -71,7 +105,8 @@ METRIC_ELEMENT_SUPPORT: Dict[str, List[str]] = {
     'radius_ratio': ['tet4', 'tet10'],  # Primary for tets
     # Elements with quad faces
     'warpage': ['hex8', 'prism6', 'pyramid5',
-                'hex20', 'hex27', 'prism15', 'wedge18', 'pyramid13'],
+                'hex20', 'hex27', 'prism15', 'wedge18',
+                'pyramid13', 'pyramid14'],
     'taper': ['hex8', 'hex20', 'hex27'],
     'orthogonality': ['hex8', 'prism6',
                       'hex20', 'hex27', 'prism15', 'wedge18'],
@@ -191,16 +226,48 @@ class VolumeCellQualityComputation(BaseOperation):
 
         from ...adapters.factory import get_adapter
         adapter = get_adapter('pyvista')
+
+        linearized_cells = _linearized_volume_cells(mesh)
+        grid = None
         try:
             grid = mesh.get_native('pyvista')
         except MeshConversionError as exc:
-            # Mesh contains element types with no VTK equivalent (e.g.
-            # pyramid14); volume quality metrics need native computation.
-            logger.warning(
-                'Skipping volume cell quality metrics (no VTK equivalent '
-                'for some element types): %s', exc,
-            )
-            return []
+            if linearized_cells is None:
+                # Mesh contains element types with no VTK equivalent and
+                # no linear corner fallback; quality needs native support.
+                logger.warning(
+                    'Skipping volume cell quality metrics (no VTK '
+                    'equivalent for some element types): %s', exc,
+                )
+                return []
+
+        # vtkCellQuality cannot evaluate quadratic cells (VTK returns
+        # its -1 sentinel for every quadratic cell), so whenever the
+        # mesh contains quadratic types the metrics are computed on a
+        # corner-only linearised grid instead.  This also unblocks
+        # pyramid14 (no VTK cell), whose pyramid5 corners carry the
+        # metric.  The linearised blocks preserve the original cell
+        # ordering, so values attribute to the original cells directly.
+        quality_grid = grid
+        linearized = False
+        if linearized_cells is not None:
+            try:
+                lin_mesh = MeshInput(
+                    vertices=mesh.vertices,
+                    faces=mesh.faces,
+                    mesh_id=f'{mesh.mesh_id}_corner_linearized',
+                    volume_cells=linearized_cells,
+                )
+                quality_grid = lin_mesh.get_native('pyvista')
+                linearized = True
+            except MeshConversionError as exc:
+                if grid is None:
+                    logger.warning(
+                        'Skipping volume cell quality metrics (native and '
+                        'linearised conversion both failed): %s', exc,
+                    )
+                    return []
+                quality_grid = grid
 
         issues: List[MeshIssue] = []
         
@@ -218,7 +285,8 @@ class VolumeCellQualityComputation(BaseOperation):
                     continue
             
             # Compute metric with error handling
-            values = self._compute_metric_safe(adapter, grid, quality_type)
+            values = self._compute_metric_safe(adapter, quality_grid,
+                                               quality_type)
             
             if values is None:
                 continue
@@ -252,6 +320,12 @@ class VolumeCellQualityComputation(BaseOperation):
             # Authoritative count consistent with issue reporting
             # (handles metric direction quirks uniformly).
             qm.violation_count = violations
+            if linearized:
+                # Mark corner-linearised provenance: midside curvature
+                # is ignored, values approximate the quadratic cells.
+                qm.metadata['linearized'] = True
+                qm.metadata['linearized_types'] = sorted(
+                    t for t in mesh.volume_cells if t in LINEAR_BASE_TYPE)
             self.last_quality_metrics.append(qm)
 
             if violations == 0:
@@ -289,6 +363,7 @@ class VolumeCellQualityComputation(BaseOperation):
                     'quality_type': quality_type,
                     'p5': float(np.percentile(valid_values, 5)),
                     'p95': float(np.percentile(valid_values, 95)),
+                    **({'linearized': True} if linearized else {}),
                 },
                 locations=locations,
             )

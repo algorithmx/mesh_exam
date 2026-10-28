@@ -97,11 +97,12 @@ def _make_prism_stack(n_layers: int, height_per_layer: float = 0.1,
         apex_idx = len(all_verts)
         all_verts.append([0.5, 0.288, z + 0.5])  # apex above stack
         vertices = np.array(all_verts, dtype=float)
-        # Tet shares top triangle face with last prism
-        # Top triangle of last prism: verts (top_tri_start, top_tri_start+1, top_tri_start+2)
-        # We reverse winding so it's consistent
+        # Tet shares top triangle face with last prism.  Under the
+        # outward-wound face tables (2026-10-28) the tet's base tuple is
+        # (2,1,0), so the natural (bottom-triangle, apex) ordering lists
+        # the shared face opposed to the prism's top face — consistent.
         volume_cells['tet4'] = np.array([[
-            top_tri_start + 2, top_tri_start + 1, top_tri_start, apex_idx
+            top_tri_start, top_tri_start + 1, top_tri_start + 2, apex_idx
         ]])
 
     return MeshInput(
@@ -187,6 +188,38 @@ def _make_prism_hex_stack(n_prism_layers: int = 3,
     )
 
 
+def _make_hex_grid_mesh(n_layers: int = 2) -> MeshInput:
+    """Structured grid of unit hex8 cells (2x2x n_layers).
+
+    Near-cubic cells: a regular hex grid, NOT a boundary layer.
+    """
+    nx = ny = 2
+    nz = n_layers
+    vertices = np.array(
+        [(x, y, z) for z in range(nz + 1) for y in range(ny + 1)
+         for x in range(nx + 1)], float)
+
+    def vid(i, j, k):
+        return k * (ny + 1) * (nx + 1) + j * (nx + 1) + i
+
+    cells = []
+    for k in range(nz):
+        for j in range(ny):
+            for i in range(nx):
+                cells.append([
+                    vid(i, j, k), vid(i + 1, j, k),
+                    vid(i + 1, j + 1, k), vid(i, j + 1, k),
+                    vid(i, j, k + 1), vid(i + 1, j, k + 1),
+                    vid(i + 1, j + 1, k + 1), vid(i, j + 1, k + 1),
+                ])
+    return MeshInput(
+        vertices=vertices,
+        faces=np.array([[0, 1, 2]]),
+        mesh_id=f'hex_grid_2x2x{nz}',
+        volume_cells={'hex8': np.array(cells)},
+    )
+
+
 def _surface_only_mesh():
     """Surface-only mesh (no volume cells)."""
     vertices = np.array([
@@ -262,6 +295,55 @@ class TestBoundaryLayerDetection:
         assert op.metadata.operation_id == 'quality_3d.check_boundary_layer'
         assert 'CFD' in op.metadata.tags
         assert 'boundary_layer' in op.metadata.tags
+
+
+class TestSeedCalibration:
+    """Wall-seed calibration gates (2026-10-28).
+
+    Regular hex grids must not be mistaken for boundary layers (thin-cell
+    gate), and an uncapped growing stack must only seed from the wall side
+    (growth-away gate).
+    """
+
+    def test_hex_grid_seeds_nothing(self):
+        """Near-cubic hex cells fail the thin-cell gate: no seeds."""
+        mesh = _make_hex_grid_mesh(2)
+        face_map = _build_face_to_cell_map(mesh)
+        boundary_keys = [k for k, v in face_map.items() if len(v) == 1]
+        seeds = _identify_wall_seed_cells(
+            mesh, face_map, set(boundary_keys)
+        )
+        assert seeds == [], (
+            f"regular hex grid must not seed BL cells, got {seeds}"
+        )
+
+    def test_hex_grid_execute_silent(self):
+        """Full check on a regular hex grid returns no issues."""
+        mesh = _make_hex_grid_mesh(2)
+        op = BoundaryLayerQualityCheck()
+        assert op.execute(mesh) == []
+
+    def test_growing_stack_seeds_only_wall_cell(self):
+        """Uncapped growing stack: the top boundary face would seed the
+        top (thickest) cell, but the growth-away gate rejects it — only
+        the wall-adjacent cell seeds.
+
+        Heights 0.01 * 2^i: top cell height 0.16 passes the thin gate
+        (inplane 1.0 / 0.16 > 2) but its opposite neighbour (0.08) is
+        thinner than 0.9 * 0.16, so it must be rejected.
+        """
+        mesh = _make_prism_stack(
+            5, height_per_layer=0.01, growth_ratio=2.0, cap_top=False
+        )
+        face_map = _build_face_to_cell_map(mesh)
+        boundary_keys = [k for k, v in face_map.items() if len(v) == 1]
+        seeds = _identify_wall_seed_cells(
+            mesh, face_map, set(boundary_keys)
+        )
+        assert len(seeds) == 1, (
+            f"expected exactly the wall-adjacent seed, got {seeds}"
+        )
+        assert seeds[0]['global_idx'] == 0
 
 
 class TestLayerTracing:
