@@ -290,6 +290,17 @@ def load_mesh_from_file(
             mesh_input.file_path = str(file_path)
             mesh_input.source_format = suffix[1:]
 
+            # Some parsers (e.g. trimesh on truncated STLs) return an
+            # empty scene instead of failing; never pass that through.
+            # Pure-volume meshes (CGNS/Exodus fixtures) may carry no
+            # surface faces, so volume_cells count as usable geometry.
+            if (len(mesh_input.vertices) == 0
+                    or (len(mesh_input.faces) == 0
+                        and not mesh_input.volume_cells)):
+                raise MeshLoadError(
+                    f"Parsed {suffix} file contains no usable mesh "
+                    f"(file may be corrupt): {file_path.name}")
+
             # Extract material assignments if requested
             if material_array_name:
                 _extract_material_data(mesh_input, native_mesh, material_array_name)

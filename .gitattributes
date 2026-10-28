@@ -1,0 +1,13 @@
+# Binary mesh files: never line-ending-normalize.  CRLF conversion
+# corrupts binary STL/VTU/VTK/Exodus/CGNS/PLY/OFF/3MF payloads and would
+# invalidate the sha256 pins in e2e/thingi10k/selection.json.
+*.stl binary
+*.vtu binary
+*.vtk binary
+*.exo binary
+*.cgns binary
+*.ply binary
+*.off binary
+*.3mf binary
+*.nas binary
+*.bdf binary

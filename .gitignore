@@ -8,4 +8,5 @@ __pycache__/
 .claude/
 CLAUDE.md
 data/
-e2e/
+e2e/thingi10k/tier2/
+e2e/thingi10k/metadata/
