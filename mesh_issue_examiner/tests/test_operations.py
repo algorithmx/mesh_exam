@@ -8,6 +8,10 @@ import numpy as np
 from mesh_issue_examiner.core.models import MeshInput, IssueCategory, IssueSeverity
 from mesh_issue_examiner.operations.topological.nonmanifold_edges import NonManifoldEdgeDetection
 from mesh_issue_examiner.operations.topological.boundary_edges import BoundaryEdgeDetection
+from mesh_issue_examiner.utils.topology import (
+    build_edge_face_map,
+    _build_edge_face_map_loop,
+)
 
 
 class TestNonManifoldEdgeDetection:
@@ -326,3 +330,101 @@ class TestBoundaryEdgeDetection:
             assert 'vertices' in loc.adjacent_elements
             assert 'incident_face' in loc.adjacent_elements
             assert len(loc.adjacent_elements['vertices']) == 2
+
+
+class TestBuildEdgeFaceMapEquivalence:
+    """Vectorized build_edge_face_map must exactly match the loop reference.
+
+    The vectorized triangle fast path and the Python-loop fallback must
+    produce identical dicts -- same keys and same face lists in the same
+    ascending face order -- for every input shape the API accepts.
+    """
+
+    @staticmethod
+    def _assert_matches_reference(faces):
+        """Assert the vectorized result equals the loop reference; return it."""
+        vectorized = build_edge_face_map(faces)
+        reference = _build_edge_face_map_loop(faces)
+        assert vectorized == reference
+        return vectorized
+
+    def test_clean_tetrahedron_surface(self):
+        """Closed tetrahedron surface: every edge shared by exactly 2 faces."""
+        faces = np.array([
+            [0, 1, 2],
+            [0, 3, 1],
+            [1, 3, 2],
+            [2, 3, 0],
+        ])
+        result = self._assert_matches_reference(faces)
+
+        assert len(result) == 6  # 4 faces x 3 edges / 2
+        assert all(len(face_list) == 2 for face_list in result.values())
+        for face_list in result.values():
+            assert face_list == sorted(face_list)
+
+    def test_nonmanifold_edge(self):
+        """Three faces sharing edge (0, 1) keep ascending face order."""
+        faces = np.array([
+            [0, 1, 2],
+            [0, 1, 3],
+            [0, 1, 4],
+        ])
+        result = self._assert_matches_reference(faces)
+
+        assert result[(0, 1)] == [0, 1, 2]
+
+    def test_boundary_edges(self):
+        """Single triangle: every edge is a boundary edge."""
+        faces = np.array([[0, 1, 2]])
+        result = self._assert_matches_reference(faces)
+
+        assert result == {(0, 1): [0], (0, 2): [0], (1, 2): [0]}
+
+    def test_degenerate_and_duplicate_faces(self):
+        """Degenerate faces (repeated vertices) and duplicate faces."""
+        faces = np.array([
+            [0, 1, 2],
+            [0, 1, 2],  # duplicate of face 0
+            [0, 0, 1],  # degenerate: repeated vertex -> self edge (0, 0)
+            [3, 3, 3],  # fully degenerate
+        ])
+        result = self._assert_matches_reference(faces)
+
+        # Face [0, 0, 1] traverses edge (0, 1) twice, so it appears twice
+        assert result[(0, 1)] == [0, 1, 2, 2]
+        assert result[(1, 2)] == [0, 1]
+        assert result[(0, 2)] == [0, 1]
+        assert result[(0, 0)] == [2]
+        assert result[(3, 3)] == [3, 3, 3]
+
+    def test_empty_faces_array(self):
+        """Empty faces arrays return an empty dict."""
+        faces = np.zeros((0, 3), dtype=int)
+        assert build_edge_face_map(faces) == {}
+        assert _build_edge_face_map_loop(faces) == {}
+
+        empty_1d = np.array([], dtype=object)
+        assert build_edge_face_map(empty_1d) == {}
+
+    def test_ragged_polygon_faces(self):
+        """Ragged mixed triangle/quad object faces use the loop fallback."""
+        faces = np.array([
+            [0, 1, 2],
+            [0, 1, 2, 3],
+        ], dtype=object)
+        result = self._assert_matches_reference(faces)
+
+        assert result[(0, 1)] == [0, 1]
+        assert result[(0, 3)] == [1]  # closing edge of the quad
+
+    def test_uniform_quad_faces(self):
+        """Uniform (non-triangular) quad faces fall back to the loop."""
+        faces = np.array([
+            [0, 1, 2, 3],
+            [0, 1, 3, 4],
+        ])
+        result = self._assert_matches_reference(faces)
+
+        assert result[(0, 1)] == [0, 1]
+        assert result[(0, 3)] == [0]  # closing edge of the first quad

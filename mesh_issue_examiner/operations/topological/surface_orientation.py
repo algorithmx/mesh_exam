@@ -229,7 +229,10 @@ class SurfaceOrientationCheck(BaseOperation):
         )
         
         return [issue]
-    
+
+    # Directed variant: unlike the shared undirected map in
+    # utils.topology.build_edge_face_map, it records each edge's traversal
+    # direction within its face, which winding-consistency checks require.
     def _build_edge_face_map(
         self, 
         mesh: MeshInput

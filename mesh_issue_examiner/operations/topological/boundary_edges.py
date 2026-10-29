@@ -7,7 +7,6 @@ open surfaces or holes in the mesh.
 
 from typing import List, Optional, Tuple, Dict, Set
 from collections import defaultdict
-import numpy as np
 
 from ...core.models import (
     MeshInput,
@@ -17,6 +16,7 @@ from ...core.models import (
     IssueSeverity,
     OperationConfig,
 )
+from ...utils.topology import build_edge_face_map
 from ..base import BaseOperation, OperationMetadata
 from ..operation_registry import registry
 from ...utils.metrics import determine_severity
@@ -54,7 +54,7 @@ class BoundaryEdgeDetection(BaseOperation):
     def execute(self, mesh: MeshInput) -> List[MeshIssue]:
         """Execute boundary edge detection."""
         # Build edge-to-face adjacency
-        edge_faces = self._build_edge_face_map(mesh)
+        edge_faces = build_edge_face_map(mesh.faces)
 
         if not edge_faces:
             return []
@@ -134,48 +134,6 @@ class BoundaryEdgeDetection(BaseOperation):
         )
 
         return [issue]
-
-    def _build_edge_face_map(self, mesh: MeshInput) -> Dict[Tuple[int, int], List[int]]:
-        """Build mapping from edges to incident faces."""
-        faces = mesh.faces
-        n_faces = len(faces)
-        if n_faces == 0:
-            return {}
-
-        # Vectorized fast path for triangular meshes
-        n_verts_per_face = faces.shape[1] if faces.ndim == 2 else None
-
-        if n_verts_per_face == 3:
-            edge_v1 = np.concatenate([faces[:, 0], faces[:, 1], faces[:, 0]])
-            edge_v2 = np.concatenate([faces[:, 1], faces[:, 2], faces[:, 2]])
-            face_indices = np.concatenate([
-                np.arange(n_faces), np.arange(n_faces), np.arange(n_faces)
-            ])
-
-            edges_min = np.minimum(edge_v1, edge_v2)
-            edges_max = np.maximum(edge_v1, edge_v2)
-
-            edge_faces = {}
-            for i in range(len(edges_min)):
-                edge = (int(edges_min[i]), int(edges_max[i]))
-                if edge not in edge_faces:
-                    edge_faces[edge] = []
-                edge_faces[edge].append(int(face_indices[i]))
-
-            return edge_faces
-
-        # Fallback for polygonal faces
-        edge_faces = {}
-        for face_idx, face in enumerate(faces):
-            n = len(face)
-            for i in range(n):
-                v1, v2 = int(face[i]), int(face[(i + 1) % n])
-                edge = (min(v1, v2), max(v1, v2))
-                if edge not in edge_faces:
-                    edge_faces[edge] = []
-                edge_faces[edge].append(face_idx)
-
-        return edge_faces
 
     def _extract_boundary_loops(
         self,
