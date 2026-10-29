@@ -50,7 +50,10 @@ class GeometricValidityAssessment(BaseOperation):
         super().__init__(config)
         self.degenerate_tolerance = degenerate_tolerance or 1e-12
         self.sliver_threshold = sliver_threshold or 1e-6  # volume / max_edge^3 ratio
-        self._adapter = get_adapter('pyvista')
+        # NOTE: the pyvista adapter is resolved lazily in execute(), not
+        # here -- this __init__ runs at import time via module-level
+        # registration, and resolving it eagerly would make the whole
+        # package unimportable on machines without pyvista.
 
     @property
     def metadata(self) -> OperationMetadata:
@@ -80,6 +83,10 @@ class GeometricValidityAssessment(BaseOperation):
         # 1. Check that the mesh has volumetric cells
         if not mesh.has_volume_cells:
             return issues
+
+        # 1b. Resolve the pyvista adapter lazily (import-safe; raises only
+        # when the operation actually runs on a volumetric mesh).
+        adapter = get_adapter('pyvista')
 
         # 2. Corner-linearised cell table: quadratic element types keep
         #    their corner connectivity (VTK node ordering places corners
@@ -124,7 +131,7 @@ class GeometricValidityAssessment(BaseOperation):
                 # Native grid remains usable; keep the original mesh.
 
         # 3. Compute cell volumes via the adapter
-        volumes = self._adapter.compute_cell_quality(grid, 'volume')
+        volumes = adapter.compute_cell_quality(grid, 'volume')
         if len(volumes) == 0:
             return issues
 

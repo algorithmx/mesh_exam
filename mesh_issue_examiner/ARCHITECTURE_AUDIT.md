@@ -562,3 +562,69 @@ Addressing these issues will significantly improve the framework's reliability a
 ---
 
 **End of Report**
+
+---
+
+# Architecture Audit — Final Status Report
+
+**Audit reference:** `mesh_issue_examiner/ARCHITECTURE_AUDIT.md` · **Verified against:** `main` @ `2026-10-29`
+
+## Overall scorecard
+
+Of the 15 discrete findings: **7 fixed, 5 partially fixed, 3 open**. All three "High" severity items are resolved; the outstanding work is concentrated in medium/low priority items plus one gap in the high-priority path-validation item.
+
+| Severity | Item | Status |
+|----------|------|--------|
+| 🔴 High | 2.1 Circular import in registry | ✅ Fixed — lazy import in `operations/_registry.py` |
+| 🔴 High | 2.2 Thread-unsafe cache eviction | ✅ Fixed — eviction now under `_lock` (`core/models.py:476-504`) |
+| 🔴 High | 2.3 Silent metric failures | ✅ Fixed — `logger.warning` + partial results (`operations/quality/cell_quality.py:219`) |
+| 🔴 High | 5.1/5.2 Path validation | 🟡 Partial — `mesh_save` restricted; **`mesh_load` unrestricted** |
+| 🟡 Medium | 2.4 Unbounded cache growth | 🟡 Partial — clearing API added; no global LRU |
+| 🟡 Medium | 2.5 `Any` types in adapters | ❌ Open |
+| 🟡 Medium | 2.6 Exception hierarchy | ✅ Fixed — unified under `MeshExaminerError` |
+| 🟡 Medium | 6.1 Test coverage | ✅ Mostly fixed — 32 test files (see gap below) |
+| 🟢 Low | 3.1 Registry singleton/DI | 🟡 Partial — single instance now; no reset/injection |
+| 🟢 Low | 3.2 Adapter import failures | ✅ Fixed — lazy library imports |
+| 🟢 Low | 3.3 `requires_adjacency` unused | ❌ Open |
+| 🟢 Low | 3.4 Mutable config | ✅ Fixed — frozen dataclass |
+| 🟢 Low | 4.1 Edge-map Python loop | ❌ Open |
+| 🟢 Low | 4.2 Loader performance | 🟡 Partial — adapter cache done; function-level imports remain |
+| 🟢 Low | #12 Benchmarks | ❌ Open |
+
+## Remaining work, prioritized
+
+1. **MCP `mesh_load` path restriction** (`mcp/server.py:572`) — the loader already supports `allowed_dirs`; the MCP handler just needs to enforce it. Highest-value remaining item since it closes the last high-priority audit recommendation. Also consider a file-size limit.
+2. **`requires_adjacency` enforcement** — either wire the metadata into a registry-level adjacency precompute or drop the field; currently it's dead metadata in 20+ operations.
+3. **Adapter type safety** (`adapters/base_adapter.py`) — introduce a `TypeVar`/`Protocol` for library mesh objects to enable static checking.
+4. **Edge-face map optimization** (`operations/topological/nonmanifold_edges.py:128`) — replace the per-edge Python loop with numpy grouping (e.g. `np.unique` on packed edge keys).
+5. **Thread-safety tests** — the one named gap in the otherwise-completed test-coverage item; no concurrency tests exist.
+6. **Nice-to-haves** — registry reset/injection for testing, global LRU for native-object caches, performance benchmarks, module-level imports in `mesh_loader.py`.
+
+## Bottom line
+
+The framework has substantially addressed the audit: every high-severity correctness issue (import cycle, race condition, silent failures) is fixed, the error-handling and config architecture were cleaned up, and test coverage grew from 2 files to 32. The codebase is in materially better shape than the 2026-04-01 audit describes. What remains is hardening (MCP load path restriction, concurrency tests) and polish (type safety, perf tuning) rather than correctness risks. The audit document itself is now stale and worth updating or annotating to reflect this state.
+
+---
+
+# Remediation Complete — 2026-10-29 (supersedes the scorecard above)
+
+The scorecard in the previous section is a point-in-time snapshot (verified 2026-10-29 01:44 UTC, before remediation). Every item it lists as 🟡 Partial or ❌ Open was subsequently fixed and merged to `main` (commits e2c124d → d438954).
+
+| Item | Was | Now | Resolution |
+|------|-----|-----|------------|
+| 5.1/5.2 Path validation | 🟡 Partial | ✅ Fixed | `mesh_load` enforces `allowed_load_dirs` + `max_file_size_bytes` (env: `MESH_EXAMINER_ALLOWED_DIRS`, `MESH_EXAMINER_MAX_FILE_BYTES`) in `mcp/server.py`; 11 new tests |
+| 2.4 Unbounded cache growth | 🟡 Partial | ✅ Fixed | Weakref-tracked global LRU across `MeshInput` instances, cap 64 (`MESH_EXAMINER_GLOBAL_CACHE_LIMIT`), evicts least-recently-used victims (`core/models.py`) |
+| 2.5 `Any` types in adapters | ❌ Open | ✅ Fixed | `MeshAdapter(ABC, Generic[TMesh])`; all 5 adapters parameterized with library types (runtime-safe); scoped `mypy.ini` added |
+| 3.1 Registry singleton/DI | 🟡 Partial | ✅ Fixed | `reset_registry()` clears/rebinds the global; `registry` is injectable into `MeshIssueExaminerServer` |
+| 3.3 `requires_adjacency` unused | ❌ Open | ✅ Fixed | `MeshInput.get_edge_face_adjacency()` memoized into the previously-dead `_adjacency_cache`; workflows prime it once per mesh for flagged operations |
+| 4.1 Edge-map Python loop | ❌ Open | ✅ Fixed | Vectorized `build_edge_face_map` (np.unique + stable argsort), 2.5–2.7× faster at 10⁴–10⁶ faces; private copies in `nonmanifold_edges`/`boundary_edges` removed; 7 equivalence tests vs the retained loop reference |
+| 4.2 Loader performance | 🟡 Partial | ✅ Fixed | Single module-level adapter import in `mesh_loader.py`; adapter instance caching already present |
+| #12 Benchmarks | ❌ Open | ✅ Fixed | `benchmarks/bench_edge_face_map.py`, `bench_loader.py` + README (dependency-free timeit scripts) |
+
+Thread-safety coverage (the 6.1 gap): new `tests/test_thread_safety.py` — concurrent `get_native`, eviction stress, invalidate-vs-get races, shared-mesh operation runs, global LRU + GC cleanup. A real `KeyError` race in `get_native` was found and fixed during this work.
+
+Follow-up fix (same day): `operations/volumetric/geometric_validity.py` resolved its pyvista adapter in `__init__` at import time, making the package unimportable without pyvista (a residual hole in item 3.2's graceful degradation). The adapter is now resolved lazily in `execute()`; verified by importing the package with pyvista blocked.
+
+Validation: full pytest suite green (1127 passed / 4 skipped at merge d438954; re-verified after the follow-up fix). Known verification gap: mypy is not installed in the project venv — run `python -m mypy mesh_issue_examiner/adapters` once available.
+
+**Bottom line: all findings from the original 2026-04-01 audit are resolved.**
