@@ -53,17 +53,29 @@ def _icosphere_l1():
     return np.array(m.vertices, dtype=np.float64), np.array(m.faces, dtype=np.int32)
 
 
-def _two_crossing_triangles():
-    """Two triangles that genuinely intersect (X-crossing)."""
+def _tent_crossing_floor():
+    """A 3-triangle "tent over a floor" that genuinely crosses.
+
+    Mirrors the e2e ``self_intersecting`` fixture: the floor triangle
+    [0,1,2] lies in y=0; the tent apex A=(0,1,-1.5) sits above it and its
+    corners B=(4,-1,-2), C=(-4,-1,-2) below, so the A-B and A-C edges
+    pierce the strict interior of the floor at (+/-2, 0, -1.75) — a
+    positive-length intersection segment, not a point contact.  The tent
+    is split into two faces sharing edge A-M; the midpoint vertex M lies
+    on a hull edge, which makes the vertex set non-convex so the manual
+    detector actually runs its pair tests (a fully convex vertex set
+    would take the convex early-out and miss the crossing).
+    """
     verts = np.array([
-        [0, 0, -0.5],
-        [1, 0, -0.5],
-        [0.5, 1, 0.5],
-        [0, 0.5, 0.5],
-        [1, 0.5, 0.5],
-        [0.5, 0, -0.5],
+        [-3, 0, -3],
+        [3, 0, -3],
+        [0, 0, 3],
+        [0, 1, -1.5],
+        [4, -1, -2],
+        [-4, -1, -2],
+        [0, -1, -2],
     ], dtype=np.float64)
-    faces = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int32)
+    faces = np.array([[0, 1, 2], [3, 4, 6], [3, 6, 5]], dtype=np.int32)
     return verts, faces
 
 
@@ -202,8 +214,12 @@ class TestDetectSelfIntersectionsManual:
         assert result == []
 
     def test_crossing_triangles_detected(self):
-        """Two genuinely crossing triangles should be detected."""
-        verts, faces = _two_crossing_triangles()
+        """Genuinely crossing triangles should be detected.
+
+        The tent's A-B and A-C edges pierce the floor triangle's interior,
+        so at least the (floor, tent-face) pairs must be reported.
+        """
+        verts, faces = _tent_crossing_floor()
         result = detect_self_intersections_manual(verts, faces)
         assert len(result) >= 1, "Expected at least one intersection for crossing triangles"
 

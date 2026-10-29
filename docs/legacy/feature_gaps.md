@@ -189,8 +189,9 @@ than one connected component, the vertex is non-manifold.
 
 ### 3. Disconnected components ✅ RESOLVED
 
-- **Sample mesh:** `disconnected_components/` — three separate components that
-  share no vertices or edges.
+- **Sample mesh:** `disconnected_components/` — two separate components (two
+  disjoint triangles) that share no vertices or edges.  (An earlier revision
+  of this document incorrectly said three.)
 - **What should happen:** For a mesh expected to be a single connected surface,
   multiple disconnected components may indicate a modeling error or
   misassembly.

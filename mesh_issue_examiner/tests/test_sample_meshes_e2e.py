@@ -2,21 +2,23 @@
 End-to-end tests loading real mesh files from e2e/sample_meshes/
 through the full pipeline: load -> inspect -> get_issues -> get_quality_metrics.
 
-The fixture files are deterministic and NOT committed (e2e/ is gitignored).
-They are regenerated automatically on the first test session by
-``tests/conftest.py`` (via scripts/generate_sample_meshes.py, which skips
-files that already exist). To rebuild them by hand:
+The fixture files are deterministic and committed to the repository;
+``tests/conftest.py`` regenerates any that are missing (via
+scripts/generate_sample_meshes.py, which skips files that already exist).
+To rebuild them by hand:
 
     python scripts/generate_sample_meshes.py --force   # recreate + verify
     python scripts/generate_sample_meshes.py --verify  # verify only
 
 Run with:
-    conda run -n PEEC python -m pytest mesh_issue_examiner/tests/test_sample_meshes_e2e.py -v
+    python -m pytest mesh_issue_examiner/tests/test_sample_meshes_e2e.py -v
 """
 
 from pathlib import Path
 
+import numpy as np
 import pytest
+import trimesh
 
 from mesh_issue_examiner.mcp.server import MeshIssueExaminerServer, MCPRequest
 
@@ -133,11 +135,21 @@ class TestTessellatedMeshes:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("mesh_name", TESSELLATED_MESHES)
     async def test_has_quality_issues(self, mesh_name):
-        """Tessellated meshes produce quality violations from face shape."""
+        """Tessellated meshes produce cell-quality violations from face shape.
+
+        The z-stretched icospheres must trip the min-angle threshold of
+        quality.compute_cell_quality (not merely the edge-dihedral op); see
+        SAMPLE_MESH_AUDIT.md and scripts/tune_sample_meshes.py.
+        """
         server = _server()
         _, inspect, issues = await _load_inspect_get_issues(server, mesh_name)
         assert issues["total_count"] > 0, (
             f"{mesh_name}: expected quality issues from tessellation"
+        )
+        op_ids = {i["operation_id"] for i in issues["issues"]}
+        assert any("quality.compute_cell_quality" in oid for oid in op_ids), (
+            f"{mesh_name}: expected a quality.compute_cell_quality issue, "
+            f"got {op_ids}"
         )
 
     @pytest.mark.asyncio
@@ -168,11 +180,18 @@ DEFECTIVE_CASES = {
     },
     "self_intersecting": {
         "expect_passed": False,
-        "expect_keywords": [],
+        "expect_keywords": ["detect_self_intersections"],
+    },
+    # Old geometry of self_intersecting, kept as the contact-inclusive
+    # counterpart: a vertex touches the interior of another triangle's
+    # edge with no proper crossing (see TestSelfIntersectionGeometry).
+    "self_intersecting_point_contact": {
+        "expect_passed": False,
+        "expect_keywords": ["detect_self_intersections"],
     },
     "varying_quality": {
         "expect_passed": False,
-        "expect_keywords": [],
+        "expect_keywords": ["aspect_ratio"],
     },
     "flipped_normals": {
         "expect_passed": False,
@@ -859,7 +878,9 @@ OPEN_MESHES = [
 CLOSED_MESHES = [
     "perfect_cube_surface",
     "torus",
-    "shell_structure",  # Thin-walled cube, actually watertight
+    # Hollow shell: outer cube wound outward, inner cube wound inward,
+    # so the enclosed solid is the space BETWEEN the cubes.
+    "shell_structure",
 ]
 
 
@@ -918,6 +939,94 @@ class TestClosedMeshes:
         assert len(boundary_issues) == 0, (
             f"{mesh_name}: Expected no boundary edges for closed mesh, "
             f"but found {len(boundary_issues)} boundary issue(s)")
+
+    @pytest.mark.asyncio
+    async def test_shell_structure_is_hollow_shell(self):
+        """shell_structure encloses the space between two cubes.
+
+        The outer unit cube is wound outward and the inner half-size cube
+        is wound inward, so the signed volume is 1 - 0.125 = 0.875 — a
+        true outer-minus-inner solid, not two nested outward-wound cubes
+        (which would sum to 1.125).
+        """
+        m = trimesh.load(_mesh_file("shell_structure"))
+        m.merge_vertices()
+        assert m.is_watertight
+        assert abs(m.volume - 0.875) < 1e-6, (
+            f"expected hollow-shell volume 0.875, got {m.volume}"
+        )
+
+
+# ===================================================================
+# 4b. Self-intersection geometry (independent of the examiner)
+# ===================================================================
+
+
+def _interior_pierce_points(subdir: str) -> list:
+    """Strict interior edge-pierce points between non-adjacent faces.
+
+    Self-contained barycentric predicate (does NOT use the examiner's
+    detector, which is the code under test): an edge pierces the STRICT
+    interior of a triangle when its endpoints lie strictly on opposite
+    sides of the triangle's plane and the hit point is strictly inside
+    the triangle.
+    """
+    m = trimesh.load(_mesh_file(subdir))
+    m.merge_vertices()
+    V, F = np.asarray(m.vertices, float), np.asarray(m.faces)
+    pts = []
+    for i in range(len(F)):
+        for j in range(len(F)):
+            if i == j or set(F[i]) & set(F[j]):
+                continue                      # adjacent: ordinary contact
+            T1, T2 = V[F[i]], V[F[j]]
+            n = np.cross(T2[1] - T2[0], T2[2] - T2[0])
+            for a, b in ((T1[0], T1[1]), (T1[1], T1[2]), (T1[2], T1[0])):
+                da, db = np.dot(a - T2[0], n), np.dot(b - T2[0], n)
+                if da * db >= -1e-15:
+                    continue                  # not strictly opposite sides
+                t = da / (da - db)
+                p = a + t * (b - a)
+                e1, e2 = T2[1] - T2[0], T2[2] - T2[0]
+                ap = p - T2[0]
+                d00, d01, d11 = (np.dot(e1, e1), np.dot(e1, e2),
+                                 np.dot(e2, e2))
+                d20, d21 = np.dot(ap, e1), np.dot(ap, e2)
+                den = d00 * d11 - d01 * d01
+                u = (d11 * d20 - d01 * d21) / den
+                v = (d00 * d21 - d01 * d20) / den
+                eps = 1e-9
+                if eps < u and eps < v and u + v < 1 - eps:
+                    pts.append(p)
+    return pts
+
+
+class TestSelfIntersectionGeometry:
+    """Geometry-level ground truth for the self-intersection fixtures.
+
+    These checks are independent of the examiner's detector (see
+    SAMPLE_MESH_AUDIT.md): the crossing fixture must genuinely cross
+    (positive-length intersection segment), while the point-contact
+    fixture must have zero proper crossings by construction.
+    """
+
+    def test_crossing_fixture_has_positive_length_segment(self):
+        pts = _interior_pierce_points("self_intersecting")
+        assert len(pts) >= 2, (
+            f"expected >=2 strict interior pierce points, got {len(pts)}"
+        )
+        dmax = max(float(np.linalg.norm(p - q)) for p in pts for q in pts)
+        assert dmax > 0.1, (
+            f"intersection segment must have positive length, max pairwise "
+            f"pierce-point distance is {dmax}"
+        )
+
+    def test_point_contact_fixture_has_no_proper_crossing(self):
+        pts = _interior_pierce_points("self_intersecting_point_contact")
+        assert pts == [], (
+            f"point-contact fixture must have no proper crossings, got "
+            f"{len(pts)} pierce point(s)"
+        )
 
 
 # ===================================================================

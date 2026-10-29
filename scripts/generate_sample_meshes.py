@@ -22,12 +22,17 @@ triangle mesh).  Consequences:
     - ``pyramid`` is a pentagonal bipyramid, ``wedge`` an icosahedron.
 * Any parameter-grid torus is a Dupin cyclide whose grid quads are exactly
   planar, so a smooth torus always trips the dihedral check.  ``torus`` is
-  a triangular-cross-section tube torus (nu=6, nv=3, 20 deg/ring twist)
-  whose vertices were numerically refined to maximise the worst-case fold
-  margin; the refined coordinates are embedded verbatim below.
-* ``icosphere_l1`` / ``icosphere_l2`` are unit icospheres stretched by 1.5 in
-  z to guarantee some sub-15-degree angles (the tessellated contract wants
-  quality issues) while staying far from self-intersection.
+  a parametric triangular-cross-section tube torus (nu=14 rings, nv=3
+  corners, per-ring twist 360/7 deg) whose constants were selected by
+  ``scripts/tune_sample_meshes.py`` so that the tube is demonstrably
+  embedded — zero proper non-adjacent triangle intersections — while every
+  fold stays inside (20, 160) deg; ``verify()`` re-asserts the
+  zero-intersection property independently of the examiner's own detector.
+* ``icosphere_l1`` / ``icosphere_l2`` are unit icospheres stretched along z
+  (see ICOSPHERE_STRETCH) far enough that some face angles drop below the
+  15-degree quality threshold (the tessellated contract wants
+  quality.compute_cell_quality issues) while convexity keeps them free of
+  self-intersections.
 
 Defective fixtures each combine one targeted defect with the smallest possible
 supporting geometry so the expected operation IDs fire with the severities the
@@ -65,31 +70,25 @@ GYRO_BAND_Z = 0.5
 # Pentagonal bipyramid circumradius (apices at +/-sqrt(1 - r^2)).
 PENTA_RADIUS = 0.85
 
-# Z-stretch applied to unit icospheres.
-ICOSPHERE_STRETCH = 1.5
+# Z-stretch applied to unit icospheres.  Chosen by scripts/tune_sample_meshes.py
+# so that both icosphere fixtures violate the min-angle quality threshold
+# (min angle drops below 15 deg) while the surface stays convex, hence free
+# of self-intersections.
+ICOSPHERE_STRETCH = 4.5
 
-# Optimized torus vertices (triangular tube, nu=6 rings x nv=3 corners,
-# 20 deg/ring twist; hill-climbed for max dihedral/angle margin).
-TORUS_VERTS = np.array([
-    [1.723313, 0.075705, -0.109234],
-    [0.937382, -0.01722, 0.625711],
-    [0.95, 0.0, -0.433013],
-    [0.829142, 1.368472, 0.117052],
-    [0.39173, 0.751865, 0.23269],
-    [0.652754, 0.923393, -0.481556],
-    [-0.739249, 1.326394, 0.371462],
-    [-0.363652, 0.674071, 0.145654],
-    [-0.595951, 1.118494, -0.489758],
-    [-1.397305, -0.099104, 0.462828],
-    [-0.704827, 0.009849, -0.016425],
-    [-1.408699, 0.122614, -0.421666],
-    [-0.631444, -1.114017, 0.488821],
-    [-0.386942, -0.672418, -0.173633],
-    [-0.775048, -1.325212, -0.260618],
-    [0.560768, -0.887324, 0.382436],
-    [0.43479, -0.755092, -0.426708],
-    [0.804391, -1.419649, -0.110221],
-])
+# Parametric triangular-tube torus (nu rings x nv corners, per-ring twist
+# of the tube cross-section).  The constants were selected by
+# scripts/tune_sample_meshes.py so that the tube is demonstrably embedded
+# (zero proper non-adjacent triangle intersections, asserted independently
+# by verify()) while keeping every fold inside (20, 160) deg and all cell
+# quality metrics above their thresholds.  Twist is 360/7 deg per ring:
+# seam-compatible, since 14 * 360/7 = 720 = 6 * 120 deg (a whole number of
+# cross-section corners).
+TORUS_NU = 14
+TORUS_NV = 3
+TORUS_MAJOR_RADIUS = 2.0
+TORUS_TUBE_RADIUS = 1.4
+TORUS_TWIST_DEG = 51.428571
 
 
 # ---------------------------------------------------------------------------
@@ -159,9 +158,31 @@ def gyro_square_bipyramid(apex_z: float = GYRO_APEX_Z,
     return v, np.array(f)
 
 
-def torus() -> tuple[np.ndarray, np.ndarray]:
-    """Triangular-tube torus with refined vertex positions (see TORUS_VERTS)."""
-    nu, nv = 6, 3
+def torus(major_radius: float = TORUS_MAJOR_RADIUS,
+          tube_radius: float = TORUS_TUBE_RADIUS,
+          twist_deg: float = TORUS_TWIST_DEG,
+          nu: int = TORUS_NU, nv: int = TORUS_NV) -> tuple[np.ndarray, np.ndarray]:
+    """Parametric triangular-tube torus (deterministic, no RNG).
+
+    Ring i sits at angle 2*pi*i/nu on the major circle; the triangular
+    cross-section of circumradius ``tube_radius`` lies in the radial/z
+    frame of the ring and is rotated by ``twist_deg`` per ring.  For
+    major_radius >> tube_radius the tube is embedded; verify()
+    independently asserts zero proper non-adjacent intersections on the
+    written file.
+    """
+    twist = np.radians(twist_deg)
+    z_axis = np.array([0.0, 0.0, 1.0])
+    v = []
+    for i in range(nu):
+        th = 2 * np.pi * i / nu
+        center = np.array([major_radius * np.cos(th),
+                           major_radius * np.sin(th), 0.0])
+        radial = np.array([np.cos(th), np.sin(th), 0.0])
+        for j in range(nv):
+            phi = 2 * np.pi * j / nv + i * twist
+            v.append(center + tube_radius * (
+                np.cos(phi) * radial + np.sin(phi) * z_axis))
     f = []
     for i in range(nu):
         i2 = (i + 1) % nu
@@ -171,7 +192,7 @@ def torus() -> tuple[np.ndarray, np.ndarray]:
             b0, b1 = i2 * nv + j, i2 * nv + j2
             f.append([t0, b0, t1])
             f.append([t1, b0, b1])
-    return _fix_winding(TORUS_VERTS.copy(), np.array(f))
+    return _fix_winding(np.array(v, float), np.array(f))
 
 
 def icosphere(subdivisions: int, stretch: float = ICOSPHERE_STRETCH,
@@ -222,22 +243,27 @@ def sliver(x0: float, y0: float, length: float = 10.0, thick: float = 0.5):
             [x0 + length / 2, y0 + thick, 0]]
 
 
-def grid_plane(n: int, holes=()) -> tuple[np.ndarray, np.ndarray]:
-    """Unit-spaced (n+1)x(n+1) grid of square cells split into triangles."""
-    verts = np.array([[i, j, 0] for i in range(n + 1) for j in range(n + 1)])
+def rect_plane(nx: int, ny: int, holes=()) -> tuple[np.ndarray, np.ndarray]:
+    """Unit-spaced (nx+1)x(ny+1) grid of square cells split into triangles."""
+    verts = np.array([[i, j, 0] for i in range(nx + 1) for j in range(ny + 1)])
     skip = {(int(h[0]), int(h[1])) for h in holes}
     f = []
-    for i in range(n):
-        for j in range(n):
+    for i in range(nx):
+        for j in range(ny):
             if (i, j) in skip:
                 continue
-            a = i * (n + 1) + j
-            b = i * (n + 1) + j + 1
-            c = (i + 1) * (n + 1) + j + 1
-            d = (i + 1) * (n + 1) + j
+            a = i * (ny + 1) + j
+            b = i * (ny + 1) + j + 1
+            c = (i + 1) * (ny + 1) + j + 1
+            d = (i + 1) * (ny + 1) + j
             f.append([a, b, c])
             f.append([a, c, d])
     return verts, np.array(f)
+
+
+def grid_plane(n: int, holes=()) -> tuple[np.ndarray, np.ndarray]:
+    """Nx n square grid (special case of rect_plane)."""
+    return rect_plane(n, n, holes)
 
 
 def cylinder(nu: int = 12, nz: int = 3, radius: float = 1.0,
@@ -382,9 +408,12 @@ CONTRACTS = {
     "torus": {"passed": True, "zero": True},
     "pyramid": {"passed": True, "zero": True},
     "wedge": {"passed": True, "zero": True},
-    # TESSELLATED: quality issues expected
-    "icosphere_l1": {"min_issues": 1},
-    "icosphere_l2": {"min_issues": 1},
+    # TESSELLATED: cell-quality issues expected (stretched ellipsoids
+    # must trip the min-angle threshold, not just the dihedral op).
+    "icosphere_l1": {"min_issues": 1,
+                      "keywords": ["compute_cell_quality"]},
+    "icosphere_l2": {"min_issues": 1,
+                      "keywords": ["compute_cell_quality"]},
     # DEFECTIVE (mirrors DEFECTIVE_CASES in test_sample_meshes_e2e.py)
     "non_manifold_edge": {"passed": False, "keywords": ["nonmanifold"]},
     "non_manifold_vertex": {"passed": True,
@@ -392,8 +421,11 @@ CONTRACTS = {
     "degenerate_triangle": {"passed": False,
                             "keywords": ["aspect_ratio", "min_angle", "max_angle"],
                             "min_warnings": 1},
-    "self_intersecting": {"passed": False, "keywords": []},
-    "varying_quality": {"passed": False, "keywords": []},
+    "self_intersecting": {"passed": False,
+                          "keywords": ["detect_self_intersections"]},
+    "self_intersecting_point_contact": {
+        "passed": False, "keywords": ["detect_self_intersections"]},
+    "varying_quality": {"passed": False, "keywords": ["aspect_ratio"]},
     "flipped_normals": {"passed": False,
                         "keywords": ["orientation", "inconsistent"]},
     "disconnected_components": {"passed": False, "keywords": ["disconnected"]},
@@ -404,7 +436,10 @@ CONTRACTS = {
     # OPEN: boundary issue required
     "open_boundary": {"boundary": True},
     "holey_plane": {"boundary": True},
-    "multi_hole_plane": {"boundary": True},
+    # 5x5 grid with two separated holes: boundary coverage only, the
+    # hole boundaries must not touch (no nonmanifold-vertex defect).
+    "multi_hole_plane": {"boundary": True,
+                         "no_keywords": ["nonmanifold"]},
     "subdivided_plane": {"boundary": True},
     "cylinder": {"boundary": True},
     "perfect_triangle": {"boundary": True},
@@ -534,11 +569,33 @@ def build_fixtures() -> dict:
                                     + sliver(3, 0) + sliver(3, 4), float),
                                 np.array([[0, 2, 1], [0, 1, 3], [1, 2, 3],
                                           [0, 3, 2], [4, 5, 6], [7, 8, 9]])),
+        # Proper X-crossing: a 3-triangle "tent over a floor" whose apex
+        # A=(0,1,-1.5) sits above the floor triangle, with two corners
+        # B=(4,-1,-2), C=(-4,-1,-2) below it.  The A-B and A-C edges pierce
+        # the strict interior of the floor triangle at (±2, 0, -1.75), so
+        # the tent and floor overlap along a positive-length segment.  The
+        # tent is split into two faces sharing edge A-M so that M lies on a
+        # hull edge (the vertex set is non-convex, dodging the detector's
+        # convex early-out) and A is closer to the pair centroid-midpoint
+        # than the pierce points, so the chord-through-interior rejection
+        # does not swallow the genuine crossing.  Geometry chosen by
+        # scripts/tune_sample_meshes.py (see also SAMPLE_MESH_AUDIT.md).
         "self_intersecting": ("stl",
-                              np.array([[0, 0, -0.5], [1, 0, -0.5],
-                                        [0.5, 1, 0.5], [0, 0.5, 0.5],
-                                        [1, 0.5, 0.5], [0.5, 0, -0.5]]),
-                              np.array([[0, 1, 2], [3, 4, 5]])),
+                              np.array([[-3, 0, -3], [3, 0, -3],
+                                        [0, 0, 3], [0, 1, -1.5],
+                                        [4, -1, -2], [-4, -1, -2],
+                                        [0, -1, -2]]),
+                              np.array([[0, 1, 2], [3, 4, 6], [3, 6, 5]])),
+        # Point-contact case: vertex (0.5, 0, -0.5) of the second triangle
+        # lies exactly on the midpoint of the first triangle's base edge —
+        # a contact-inclusive detection case with no proper crossing.
+        "self_intersecting_point_contact": ("stl",
+                                            np.array([[0, 0, -0.5], [1, 0, -0.5],
+                                                      [0.5, 1, 0.5],
+                                                      [0, 0.5, 0.5],
+                                                      [1, 0.5, 0.5],
+                                                      [0.5, 0, -0.5]]),
+                                            np.array([[0, 1, 2], [3, 4, 5]])),
         # vertex 0 pushed far out: 5/20 spike faces reach AR 10-16.5
         # (rate 0.25 > 0.2 -> ERROR; min_angle is severity-capped, AR is not)
         "varying_quality": ("stl",
@@ -556,20 +613,28 @@ def build_fixtures() -> dict:
                                     np.array([[0, 1, 2], [3, 4, 5]])),
         "duplicate_vertices": ("stl", tet_v,
                                np.vstack([tet_f, tet_f[1]])),
-        # open
-        "open_boundary": ("stl", *grid_plane(1)),
+        # open (open_boundary is a 1x2 rectangle so it is distinct from
+        # perfect_square, which stays the unit square)
+        "open_boundary": ("stl", *rect_plane(2, 1)),
         "holey_plane": ("stl", *grid_plane(3, holes=[(1, 1)])),
-        "multi_hole_plane": ("stl", *grid_plane(4, holes=[(1, 1), (2, 2)])),
+        # 5x5 grid: on a 4x4 grid any two interior cells touch, which
+        # made the two holes share the vertex (2,2,0) and added an
+        # unintended nonmanifold-vertex defect.  Cells (1,1) and (3,3)
+        # are separated by cell (2,2): two independent 4-edge holes.
+        "multi_hole_plane": ("stl", *grid_plane(5, holes=[(1, 1), (3, 3)])),
         "subdivided_plane": ("stl", *grid_plane(4)),
         "cylinder": ("stl", *cylinder()),
         "perfect_triangle": ("stl",
                              np.array([[0, 0, 0], [1, 0, 0], [0.5, 0.9, 0]]),
                              np.array([[0, 1, 2]])),
         "perfect_square": ("stl", *grid_plane(1)),
-        # closed
+        # closed: hollow shell — outer cube wound outward, inner cube
+        # reversed so the enclosed signed volume is 1 - 0.125 = 0.875
+        # (a true outer-minus-inner solid, not two nested outward-wound
+        # cubes which would sum to 1.125).
         "shell_structure": ("stl",
                             np.vstack([cube_v, cube_v * 0.5]),
-                            np.vstack([cube_f, cube_f + 8])),
+                            np.vstack([cube_f, (cube_f + 8)[:, ::-1]])),
     }
     return out
 
@@ -844,6 +909,70 @@ def write_meshio_volume(path: Path, ext: str) -> None:
     mesh.write(str(path))
 
 
+# ---------------------------------------------------------------------------
+# Independent geometric checks (do NOT use the examiner's detector)
+# ---------------------------------------------------------------------------
+
+def _load_surface(path: Path):
+    """Load an on-disk surface fixture with exactly merged coordinates."""
+    m = trimesh.load(str(path))
+    m.merge_vertices()
+    return np.asarray(m.vertices, float), np.asarray(m.faces)
+
+
+def _edge_pierce_interior(seg_a, seg_b, tri) -> bool:
+    """True when segment a-b crosses the strict interior of tri
+    (endpoints strictly on opposite sides; hit point strictly inside)."""
+    n = np.cross(tri[1] - tri[0], tri[2] - tri[0])
+    da, db = np.dot(seg_a - tri[0], n), np.dot(seg_b - tri[0], n)
+    if da * db >= -1e-15:
+        return False
+    t = da / (da - db)
+    p = seg_a + t * (seg_b - seg_a)
+    e1, e2 = tri[1] - tri[0], tri[2] - tri[0]
+    ap = p - tri[0]
+    d00, d01, d11 = (np.dot(e1, e1), np.dot(e1, e2), np.dot(e2, e2))
+    d20, d21 = np.dot(ap, e1), np.dot(ap, e2)
+    den = d00 * d11 - d01 * d01
+    u = (d11 * d20 - d01 * d21) / den
+    v = (d00 * d21 - d01 * d20) / den
+    eps = 1e-9
+    return eps < u and eps < v and u + v < 1 - eps
+
+
+def proper_intersection_pairs(path: Path) -> list:
+    """Independent proper-crossing check on an on-disk surface file.
+
+    Reports non-adjacent face pairs (i, j) where an edge of one triangle
+    passes through the strict interior of the other.  Self-contained so
+    the fixture verification does not depend on the examiner's detector
+    (which is the code under test).  Adjacent faces (shared vertex) are
+    ordinary contact and excluded.
+    """
+    V, F = _load_surface(path)
+    out = []
+    for i in range(len(F)):
+        for j in range(i + 1, len(F)):
+            if set(F[i]) & set(F[j]):
+                continue                       # adjacent: ordinary contact
+            T1, T2 = V[F[i]], V[F[j]]
+            lo = np.maximum(T1.min(0), T2.min(0))
+            hi = np.minimum(T1.max(0), T2.max(0))
+            if np.any(hi < lo - 1e-12):
+                continue                       # disjoint bounding boxes
+            hit = False
+            for T, U in ((T1, T2), (T2, T1)):
+                for a, b in ((T[0], T[1]), (T[1], T[2]), (T[2], T[0])):
+                    if _edge_pierce_interior(a, b, U):
+                        hit = True
+                        break
+                if hit:
+                    break
+            if hit:
+                out.append((int(i), int(j)))
+    return out
+
+
 def generate(force: bool = False) -> list:
     """Write all fixtures; returns list of written paths."""
     fixtures = build_fixtures()
@@ -961,6 +1090,16 @@ async def verify() -> int:
             problems.append(f"passed={insp['passed']} want {contract['passed']}")
         if contract.get("zero") and iss["total_count"] != 0:
             problems.append(f"issues={sorted(op_ids)}")
+        # Independent gate: a zero-issue surface fixture must also be free
+        # of proper non-adjacent triangle intersections, checked without
+        # the examiner's own detector (which missed the 2026-10 torus
+        # self-intersections recorded in SAMPLE_MESH_AUDIT.md).
+        if contract.get("zero") and path.suffix in (".stl", ".obj"):
+            crossings = proper_intersection_pairs(path)
+            if crossings:
+                problems.append(
+                    f"{len(crossings)} proper non-adjacent intersection(s), "
+                    f"first at faces {crossings[0]}")
         if not contract.get("zero") and iss["total_count"] == 0:
             problems.append("expected issues but got none")
         for kw in contract.get("keywords", []):
