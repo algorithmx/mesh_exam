@@ -153,16 +153,17 @@ class TestMeshIssueExaminerServer:
         assert isinstance(server._result_cache, dict)
         assert len(server._result_cache) == 0
 
-    def test_get_tools_returns_five_definitions(self):
+    def test_get_tools_returns_six_definitions(self):
         server = _make_server()
         tools = server.get_tools()
-        assert len(tools) == 5
+        assert len(tools) == 6
         names = {t["name"] for t in tools}
         assert names == {
             "mesh_load",
             "mesh_inspect",
             "mesh_get_issues",
             "mesh_get_quality_metrics",
+            "mesh_render",
             "mesh_clear_cache",
         }
 
@@ -248,16 +249,17 @@ class TestMeshIssueExaminerServer:
         assert isinstance(server._mesh_cache, dict)
 
     def test_server_tools_registered_after_auto_init(self):
-        """After init with auto_register, the 5 builtin MCP tools are available."""
+        """After init with auto_register, the 6 builtin MCP tools are available."""
         server = MeshIssueExaminerServer(auto_register_operations=True)
         tools = server.get_tools()
-        assert len(tools) == 5
+        assert len(tools) == 6
         names = {t["name"] for t in tools}
         assert names == {
             "mesh_load",
             "mesh_inspect",
             "mesh_get_issues",
             "mesh_get_quality_metrics",
+            "mesh_render",
             "mesh_clear_cache",
         }
 
@@ -285,7 +287,7 @@ class TestMeshIssueExaminerServer:
         server = _make_server()
         r = repr(server)
         assert "MeshIssueExaminerServer" in r
-        assert "5 tools" in r
+        assert "6 tools" in r
 
 
 # ---------------------------------------------------------------------------

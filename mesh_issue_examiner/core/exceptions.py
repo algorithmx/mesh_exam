@@ -31,3 +31,8 @@ class InvalidMeshError(MeshExaminerError):
 class LibraryNotAvailableError(MeshExaminerError):
     """Raised when required library is not installed."""
     pass
+
+
+class VisualizationError(MeshExaminerError):
+    """Raised when rendering or visualization fails."""
+    pass

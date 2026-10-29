@@ -608,9 +608,40 @@ The MCP server exposes mesh inspection as tools that an AI agent can call throug
 |------|-------------|-----------------|
 | `mesh_load` | Load a mesh file, return mesh ID | `file_path` |
 | `mesh_inspect` | Run inspection operations on a loaded mesh | `mesh_id` |
-| `mesh_get_result` | Retrieve a cached inspection result | `mesh_id` |
+| `mesh_get_issues` | Retrieve filtered/paginated issues from an inspection | `mesh_id` |
+| `mesh_get_quality_metrics` | Retrieve quality metrics from an inspection | `mesh_id` |
+| `mesh_render` | Render a loaded mesh to a PNG (camera/appearance control, metric or material coloring, issue highlight markers) | `mesh_id` |
 | `mesh_clear_cache` | Clear mesh and result caches | _(none)_ |
-| `list_operations` | List available operations, optionally filtered | _(none)_ |
+
+### Visualization
+
+Controlled, offscreen rendering lives in `mesh_issue_examiner.visualization`:
+
+```python
+from mesh_issue_examiner.visualization import render_mesh
+
+# Basic offscreen render
+rr = render_mesh(mesh, "out.png", view="iso", width=1600, height=900)
+
+# Camera fine-control (any named view + degrees)
+rr = render_mesh(mesh, "angled.png", view="front", azimuth=25.0, elevation=10.0, zoom=1.4)
+
+# Color cells by a cached quality metric (from an InspectionResult)
+rr = render_mesh(mesh, "quality.png", scalars="scaled_jacobian", cmap="coolwarm", result=result)
+
+# Color volume cells by material ID (requires load with material_array_name)
+rr = render_mesh(mesh, "materials.png", scalars="material")
+
+# Overlay severity-colored markers at detected issue locations
+rr = render_mesh(mesh, "issues.png", issues=result.issues,
+                 highlight_severities=("critical", "error"))
+```
+
+The same capability is exposed over MCP via the `mesh_render` tool (path,
+view, camera, size, color, scalars, scalar bar, and issue highlighting
+parameters). Rendering requires an OpenGL-capable environment; when no
+offscreen GL context can be created, a `VisualizationError` with guidance
+is raised.
 
 ### Request / Response
 

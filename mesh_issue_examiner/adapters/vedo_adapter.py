@@ -48,6 +48,12 @@ class VedoAdapter(MeshAdapter):
     - decimate(): Simplify mesh
     - smooth(): Apply smoothing filters
     - compute_curvature(): Compute surface curvature
+
+    **Visualization note:** ``visualize()``/``visualize_quality()`` are
+    interactive-only (blocking ``vedo.show()`` windows) and require the
+    optional ``vedo`` dependency to be installed. For controlled,
+    offscreen-capable rendering use ``mesh_issue_examiner.visualization``
+    (PyVista-based) instead.
     """
 
     def __init__(self):

@@ -322,6 +322,104 @@ class MeshIssueExaminerServer:
             }
         )
 
+        # Render mesh to PNG (controlled visualization)
+        self._tools['mesh_render'] = MCPTool(
+            name='mesh_render',
+            description=(
+                'Render a loaded mesh to a PNG image with programmatic '
+                'camera and appearance control. Offscreen (no interactive '
+                'window). Optionally color cells by material ID or a '
+                'quality metric, and overlay severity-colored markers at '
+                'detected issue locations. Metric coloring and issue '
+                'highlighting require a prior mesh_inspect.'
+            ),
+            input_schema={
+                'type': 'object',
+                'properties': {
+                    'mesh_id': {
+                        'type': 'string',
+                        'description': 'Identifier returned by mesh_load.',
+                        'minLength': 1
+                    },
+                    'output_path': {
+                        'type': 'string',
+                        'description': (
+                            'Absolute path for the PNG file (parent directory '
+                            'must exist). Defaults to '
+                            '<temp dir>/<mesh_id>_render.png.'
+                        )
+                    },
+                    'view': {
+                        'type': 'string',
+                        'enum': ['iso', 'front', 'back', 'left', 'right', 'top', 'bottom'],
+                        'description': 'Named camera view (default iso).'
+                    },
+                    'azimuth': {
+                        'type': 'number',
+                        'description': 'Extra azimuth rotation in degrees added to the view.'
+                    },
+                    'elevation': {
+                        'type': 'number',
+                        'description': 'Extra elevation rotation in degrees added to the view.'
+                    },
+                    'zoom': {
+                        'type': 'number',
+                        'description': 'Camera zoom (1.0 = default framing, >1 zooms in).',
+                        'exclusiveMinimum': 0
+                    },
+                    'width': {
+                        'type': 'integer', 'minimum': 64, 'maximum': 8192,
+                        'description': 'Image width in pixels (default 1200).'
+                    },
+                    'height': {
+                        'type': 'integer', 'minimum': 64, 'maximum': 8192,
+                        'description': 'Image height in pixels (default 800).'
+                    },
+                    'color': {
+                        'type': 'string',
+                        'description': 'Base mesh color when scalars are not used (default lightblue).'
+                    },
+                    'show_edges': {
+                        'type': 'boolean',
+                        'description': 'Draw mesh edges (default true).'
+                    },
+                    'scalars': {
+                        'type': 'string',
+                        'description': (
+                            'Color the mesh by "material" (requires load '
+                            'with material_array_name) or by a metric name '
+                            'from the last inspection (e.g. "scaled_jacobian", '
+                            '"aspect_ratio").'
+                        )
+                    },
+                    'cmap': {
+                        'type': 'string',
+                        'description': 'Colormap for scalar coloring (default viridis).'
+                    },
+                    'scalar_bar': {
+                        'type': 'boolean',
+                        'description': 'Show a scalar bar when scalars are used (default true).'
+                    },
+                    'highlight_issues': {
+                        'type': 'boolean',
+                        'description': (
+                            'Overlay severity-colored markers at issue '
+                            'locations from the last inspection (default false).'
+                        )
+                    },
+                    'severity': {
+                        'type': 'string',
+                        'enum': ['info', 'warning', 'error', 'critical'],
+                        'description': (
+                            'Restrict highlight markers to one severity. '
+                            'Default highlights critical + error.'
+                        )
+                    }
+                },
+                'required': ['mesh_id']
+            }
+        )
+
         # Save mesh to file (opt-in: keeps the default tool surface stable)
         if self._enable_save_tool:
             self._tools['mesh_save'] = MCPTool(
@@ -416,6 +514,9 @@ class MeshIssueExaminerServer:
 
             elif method == 'mesh_get_quality_metrics':
                 result = self._handle_get_quality_metrics(request.params)
+
+            elif method == 'mesh_render':
+                result = self._handle_render(request.params)
 
             elif method == 'mesh_save':
                 result = self._handle_save(request.params)
@@ -625,6 +726,73 @@ class MeshIssueExaminerServer:
             'mesh_id': mesh_id,
             'metric_count': len(metrics),
             'metrics': [m.to_dict() for m in metrics],
+        }
+
+    def _handle_render(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Render a cached mesh to a PNG image (controlled visualization)."""
+        mesh_id = params['mesh_id']
+        mesh = self._mesh_cache.get(mesh_id)
+        if mesh is None:
+            raise ValueError(f"Mesh not found: {mesh_id}")
+
+        highlight = bool(params.get('highlight_issues', False))
+        severity = params.get('severity')
+        scalars = params.get('scalars')
+
+        needs_result = highlight or (scalars is not None and scalars != 'material')
+        cached_result = self._result_cache.get(mesh_id)
+        if needs_result and cached_result is None:
+            raise ValueError(
+                f"No inspection result for mesh: {mesh_id}. "
+                f"Run mesh_inspect first."
+            )
+
+        issues = cached_result.issues if highlight else None
+        if severity is not None:
+            highlight_severities = (severity,)
+        else:
+            highlight_severities = ('critical', 'error')
+
+        output = params.get('output_path')
+        if output is None:
+            import tempfile
+            output = str(Path(tempfile.gettempdir()) / f"{mesh_id}_render.png")
+        out_path = Path(output)
+        if out_path.suffix == '':
+            out_path = out_path.with_suffix('.png')
+        if not out_path.parent.exists():
+            raise ValueError(f"Output directory does not exist: {out_path.parent}")
+
+        # Lazy import keeps pyvista/VTK off the server startup path.
+        from ..visualization import render_mesh
+
+        render_result = render_mesh(
+            mesh,
+            out_path,
+            view=params.get('view', 'iso'),
+            azimuth=params.get('azimuth'),
+            elevation=params.get('elevation'),
+            zoom=params.get('zoom'),
+            width=params.get('width', 1200),
+            height=params.get('height', 800),
+            color=params.get('color', 'lightblue'),
+            show_edges=params.get('show_edges', True),
+            scalars=scalars,
+            cmap=params.get('cmap', 'viridis'),
+            scalar_bar=params.get('scalar_bar', True),
+            issues=issues,
+            highlight_severities=highlight_severities,
+            result=cached_result if needs_result else None,
+        )
+
+        return {
+            'mesh_id': mesh_id,
+            'path': render_result.path,
+            'width': render_result.width,
+            'height': render_result.height,
+            'bytes': os.path.getsize(render_result.path),
+            'n_highlighted': render_result.n_highlighted,
+            'scalars_used': render_result.scalars_used,
         }
 
     def _handle_clear_cache(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -922,6 +1090,96 @@ def create_mcp_server(
         if metric_name is not None:
             params["metric_name"] = metric_name
         result = backend._handle_get_quality_metrics(params)
+        return json.dumps(result, indent=2)
+
+    # -- mesh_render -------------------------------------------------------
+
+    @mcp.tool()
+    def mesh_render(
+        mesh_id: str,
+        output_path: str | None = None,
+        view: str = "iso",
+        azimuth: float | None = None,
+        elevation: float | None = None,
+        zoom: float | None = None,
+        width: int = 1200,
+        height: int = 800,
+        color: str = "lightblue",
+        show_edges: bool = True,
+        scalars: str | None = None,
+        cmap: str = "viridis",
+        scalar_bar: bool = True,
+        highlight_issues: bool = False,
+        severity: str | None = None,
+    ) -> str:
+        """Render a loaded mesh to a PNG image (controlled visualization).
+
+        Offscreen render with programmatic camera and appearance control.
+        Call after mesh_load; metric coloring and issue highlighting
+        additionally require mesh_inspect.
+
+        Args:
+            mesh_id: Identifier returned by mesh_load.
+            output_path: Absolute path for the PNG (parent directory must
+                exist).  Defaults to <temp dir>/<mesh_id>_render.png.
+            view: Named camera view -- "iso" | "front" | "back" | "left"
+                | "right" | "top" | "bottom" (default "iso").
+            azimuth: Extra azimuth rotation in degrees added to the view.
+            elevation: Extra elevation rotation in degrees added to the view.
+            zoom: Camera zoom (1.0 = default framing, >1 zooms in).
+            width: Image width in pixels (default 1200).
+            height: Image height in pixels (default 800).
+            color: Base mesh color when scalars are not used.
+            show_edges: Draw mesh edges (default True).
+            scalars: "material" to color volume cells by material ID, or a
+                metric name from the last inspection (e.g. "aspect_ratio",
+                "scaled_jacobian").
+            cmap: Colormap for scalar coloring (default "viridis").
+            scalar_bar: Show scalar bar when scalars are used (default True).
+            highlight_issues: Overlay severity-colored markers at issue
+                locations from the last inspection (default False).
+            severity: Restrict highlight markers to one severity -- "critical"
+                | "error" | "warning" | "info".  Default highlights
+                critical + error.
+
+        Returns:
+            JSON with mesh_id, path, width, height, bytes, n_highlighted,
+            and scalars_used.
+
+        Errors:
+            ValueError -- mesh_id not found, no inspection result when
+                required, bad output directory, or invalid parameters.
+
+        Example::
+
+            mesh_render(mesh_id="bracket")
+            mesh_render(mesh_id="bracket", view="top", width=1600,
+                        highlight_issues=True)
+            mesh_render(mesh_id="tank", scalars="scaled_jacobian",
+                        cmap="coolwarm")
+        """
+        params: Dict[str, Any] = {
+            "mesh_id": mesh_id,
+            "view": view,
+            "width": width,
+            "height": height,
+            "color": color,
+            "show_edges": show_edges,
+            "cmap": cmap,
+            "scalar_bar": scalar_bar,
+            "highlight_issues": highlight_issues,
+        }
+        for key, value in (
+            ("output_path", output_path),
+            ("azimuth", azimuth),
+            ("elevation", elevation),
+            ("zoom", zoom),
+            ("scalars", scalars),
+            ("severity", severity),
+        ):
+            if value is not None:
+                params[key] = value
+        result = backend._handle_render(params)
         return json.dumps(result, indent=2)
 
     # -- mesh_save ---------------------------------------------------------
