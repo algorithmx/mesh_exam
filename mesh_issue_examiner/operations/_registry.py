@@ -16,6 +16,16 @@ used by ``base.register_operation()``.
 _registry = None
 
 
+def _clear_cache():
+    """Reset the cached singleton so the next get_registry() re-resolves.
+
+    Used by ``operation_registry.reset_registry()`` so the lazy accessor
+    picks up a freshly created registry after a reset.
+    """
+    global _registry
+    _registry = None
+
+
 def get_registry():
     """Get the global operation registry singleton.
 
