@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import List, Optional, Union, Dict, Any
 import numpy as np
 
+from ..adapters.factory import get_adapter
 from ..core.models import MeshInput
 from ..core.exceptions import MeshLoadError, UnsupportedFormatError
 
@@ -275,7 +276,6 @@ def load_mesh_from_file(
 
     # Load using selected library
     try:
-        from ..adapters.factory import get_adapter
         adapter = get_adapter(selected_library)
 
         native_mesh = adapter.load_mesh(str(file_path), **kwargs)
@@ -418,7 +418,6 @@ def save_mesh_to_file(
             else:
                 library = libs[0]
 
-    from ..adapters.factory import get_adapter
     adapter = get_adapter(library)
 
     # Special handling for meshio adapter's save method
@@ -433,7 +432,6 @@ def save_mesh_to_file(
 def _is_library_available(library: str) -> bool:
     """Check if a library is installed."""
     try:
-        from ..adapters.factory import get_adapter
         get_adapter(library)
         return True
     except ImportError:
