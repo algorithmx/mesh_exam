@@ -130,6 +130,8 @@ class MeshIssueExaminerServer:
         auto_register_operations: bool = True,
         enable_save_tool: bool = False,
         allowed_save_dirs: Optional[List[Union[str, Path]]] = None,
+        allowed_load_dirs: Optional[List[Union[str, Path]]] = None,
+        max_file_size_bytes: Optional[int] = None,
     ):
         """
         Initialize the MCP server.
@@ -146,6 +148,16 @@ class MeshIssueExaminerServer:
             allowed_save_dirs: Optional list of directories ``mesh_save``
                 may write into. When provided, an output_path that does
                 not resolve under one of these directories is rejected.
+            allowed_load_dirs: Optional list of directories ``mesh_load``
+                may read from. When provided (or set via the
+                ``MESH_EXAMINER_ALLOWED_DIRS`` environment variable as a
+                comma/semicolon-separated list), a file_path that does not
+                resolve under one of these directories is rejected.
+                Unset/unrestricted by default, preserving prior behavior.
+            max_file_size_bytes: Optional maximum size in bytes for files
+                loaded via ``mesh_load``. Defaults to the
+                ``MESH_EXAMINER_MAX_FILE_BYTES`` environment variable when
+                the parameter is None; unset means unlimited.
         """
         self.config = config or OperationConfig()
         self._mesh_cache: Dict[str, MeshInput] = {}
@@ -156,6 +168,27 @@ class MeshIssueExaminerServer:
             [Path(d).resolve() for d in allowed_save_dirs]
             if allowed_save_dirs is not None else None
         )
+        # Env fallbacks are read lazily here (not at import time) so tests
+        # can monkeypatch the environment or pass parameters directly.
+        if allowed_load_dirs is None:
+            raw_dirs = os.environ.get('MESH_EXAMINER_ALLOWED_DIRS', '')
+            entries = [e for e in raw_dirs.replace(';', ',').split(',') if e.strip()]
+            allowed_load_dirs = entries or None
+        self.allowed_load_dirs = (
+            [Path(d).resolve() for d in allowed_load_dirs]
+            if allowed_load_dirs is not None else None
+        )
+        if max_file_size_bytes is None:
+            raw_size = os.environ.get('MESH_EXAMINER_MAX_FILE_BYTES', '')
+            if raw_size.strip():
+                try:
+                    max_file_size_bytes = int(raw_size.strip())
+                except ValueError:
+                    logger.warning(
+                        "Ignoring non-integer MESH_EXAMINER_MAX_FILE_BYTES=%r",
+                        raw_size,
+                    )
+        self.max_file_size_bytes = max_file_size_bytes
 
         if auto_register_operations:
             self._register_builtin_tools()
@@ -169,7 +202,9 @@ class MeshIssueExaminerServer:
                 'Load a mesh file for inspection. Reads a mesh from disk '
                 '(STL, OBJ, PLY, VTK, NAS, and 30+ other formats) and '
                 'stores it in the server cache. Returns mesh_id, vertex/face '
-                'counts, bounding box, and format.'
+                'counts, bounding box, and format. The server may optionally '
+                'restrict loadable paths to configured allowed directories '
+                'and enforce a maximum file size.'
             ),
             input_schema={
                 'type': 'object',
@@ -578,6 +613,28 @@ class MeshIssueExaminerServer:
         if not resolved.exists():
             raise FileNotFoundError(f"Mesh file not found: {resolved}")
 
+        # Server-side restrictions (audit 5.1/5.2): optional allowed-dirs
+        # containment and maximum file size, enforced before any parsing.
+        if self.allowed_load_dirs is not None:
+            inside = any(
+                str(resolved) == str(d)
+                or str(resolved).startswith(str(d) + os.sep)
+                for d in self.allowed_load_dirs
+            )
+            if not inside:
+                raise ValueError(
+                    f"Path '{resolved}' is outside allowed load "
+                    f"directories: {[str(d) for d in self.allowed_load_dirs]}"
+                )
+
+        if self.max_file_size_bytes is not None:
+            size = os.path.getsize(resolved)
+            if size > self.max_file_size_bytes:
+                raise ValueError(
+                    f"Mesh file '{resolved}' is {size} bytes, exceeding the "
+                    f"configured limit of {self.max_file_size_bytes} bytes"
+                )
+
         mesh_id = params.get('mesh_id')
         library = params.get('library')
         material_array_name = params.get('material_array_name')
@@ -911,6 +968,8 @@ def create_mcp_server(
 
         Use this tool when you need to import a mesh from a local file
         (STL, OBJ, PLY, VTK, NAS, and other formats supported by meshio).
+        The server may optionally restrict loadable paths to configured
+        allowed directories and enforce a maximum file size.
 
         Args:
             file_path: Absolute or relative path to the mesh file.
