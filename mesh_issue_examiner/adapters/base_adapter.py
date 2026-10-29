@@ -26,7 +26,7 @@ Example:
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Tuple, Optional, TYPE_CHECKING
+from typing import Any, Dict, Generic, List, Tuple, Optional, TypeVar, TYPE_CHECKING
 
 import numpy as np
 
@@ -35,14 +35,27 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Type variable for the library-specific mesh object an adapter wraps
+# (e.g. ``pyvista.PolyData``, ``trimesh.Trimesh``). Concrete adapters
+# parameterize ``MeshAdapter`` with string forward references so that no
+# mesh library is imported at module import time.
+TMesh = TypeVar('TMesh')
 
-class MeshAdapter(ABC):
+
+class MeshAdapter(ABC, Generic[TMesh]):
     """Abstract base class for library-specific mesh adapters.
     
     Adapters provide a unified interface to library-specific mesh
     representations and operations. Each adapter bridges between the
     canonical MeshInput format and a specific mesh library's format.
-    
+
+    The class is generic over ``TMesh``, the library-specific mesh type
+    it wraps. Concrete adapters parameterize it with string forward
+    references (e.g. ``MeshAdapter['trimesh.Trimesh']``) so that no mesh
+    library is imported at runtime; the base class can also be
+    subclassed without a parameter, in which case the mesh type
+    defaults to ``Any``.
+
     Adapters support two types of meshes:
     - **Surface meshes (2D)**: Triangular or polygonal face meshes
     - **Volumetric meshes (3D)**: Tetrahedral, hexahedral, prism, or pyramid cells
@@ -130,7 +143,7 @@ class MeshAdapter(ABC):
     # ======================================================================
 
     @abstractmethod
-    def load_mesh(self, file_path: str, **kwargs) -> Any:
+    def load_mesh(self, file_path: str, **kwargs) -> TMesh:
         """Load mesh from file.
         
         Args:
@@ -146,7 +159,7 @@ class MeshAdapter(ABC):
         pass
 
     @abstractmethod
-    def create_mesh(self, vertices: np.ndarray, faces: np.ndarray) -> Any:
+    def create_mesh(self, vertices: np.ndarray, faces: np.ndarray) -> TMesh:
         """Create mesh from vertex and face arrays.
         
         Args:
@@ -159,7 +172,7 @@ class MeshAdapter(ABC):
         pass
 
     @abstractmethod
-    def get_vertices(self, mesh: Any) -> np.ndarray:
+    def get_vertices(self, mesh: TMesh) -> np.ndarray:
         """Extract vertex array from mesh.
         
         Args:
@@ -171,7 +184,7 @@ class MeshAdapter(ABC):
         pass
 
     @abstractmethod
-    def get_faces(self, mesh: Any) -> np.ndarray:
+    def get_faces(self, mesh: TMesh) -> np.ndarray:
         """Extract face array from mesh.
         
         Args:
@@ -187,7 +200,7 @@ class MeshAdapter(ABC):
     # ======================================================================
 
     @abstractmethod
-    def is_watertight(self, mesh: Any) -> bool:
+    def is_watertight(self, mesh: TMesh) -> bool:
         """Check if mesh is watertight (closed manifold).
         
         A mesh is watertight if it has no boundary edges - every edge
@@ -202,7 +215,7 @@ class MeshAdapter(ABC):
         pass
 
     @abstractmethod
-    def is_manifold(self, mesh: Any) -> Tuple[bool, List[Dict[str, Any]]]:
+    def is_manifold(self, mesh: TMesh) -> Tuple[bool, List[Dict[str, Any]]]:
         """Check if mesh is manifold.
         
         A manifold mesh has consistent topology where:
@@ -219,7 +232,7 @@ class MeshAdapter(ABC):
         pass
 
     @abstractmethod
-    def get_boundary_edges(self, mesh: Any) -> np.ndarray:
+    def get_boundary_edges(self, mesh: TMesh) -> np.ndarray:
         """Get edges that are on the mesh boundary.
         
         Boundary edges are edges that belong to only one face.
@@ -233,7 +246,7 @@ class MeshAdapter(ABC):
         pass
 
     @abstractmethod
-    def get_nonmanifold_edges(self, mesh: Any) -> List[Tuple[int, int, int]]:
+    def get_nonmanifold_edges(self, mesh: TMesh) -> List[Tuple[int, int, int]]:
         """Get non-manifold edges.
         
         Non-manifold edges are edges shared by more than 2 faces.
@@ -249,7 +262,7 @@ class MeshAdapter(ABC):
     @abstractmethod
     def get_duplicate_vertices(
         self,
-        mesh: Any,
+        mesh: TMesh,
         tolerance: float
     ) -> List[int]:
         """Find duplicate vertices.
@@ -268,7 +281,7 @@ class MeshAdapter(ABC):
     # ======================================================================
 
     @abstractmethod
-    def compute_face_areas(self, mesh: Any) -> np.ndarray:
+    def compute_face_areas(self, mesh: TMesh) -> np.ndarray:
         """Compute area of each face.
         
         Args:
@@ -280,7 +293,7 @@ class MeshAdapter(ABC):
         pass
 
     @abstractmethod
-    def compute_face_normals(self, mesh: Any) -> np.ndarray:
+    def compute_face_normals(self, mesh: TMesh) -> np.ndarray:
         """Compute normal vector for each face.
         
         Args:
@@ -292,7 +305,7 @@ class MeshAdapter(ABC):
         pass
 
     @abstractmethod
-    def detect_self_intersections(self, mesh: Any) -> List[Tuple[int, int]]:
+    def detect_self_intersections(self, mesh: TMesh) -> List[Tuple[int, int]]:
         """Detect self-intersecting face pairs.
         
         Args:
@@ -306,7 +319,7 @@ class MeshAdapter(ABC):
     @abstractmethod
     def compute_cell_quality(
         self,
-        mesh: Any,
+        mesh: TMesh,
         quality_type: str
     ) -> np.ndarray:
         """Compute cell quality metric.
@@ -338,7 +351,7 @@ class MeshAdapter(ABC):
     # Conversion Methods
     # ======================================================================
 
-    def get_volume_cells(self, mesh: Any) -> Dict[str, np.ndarray]:
+    def get_volume_cells(self, mesh: TMesh) -> Dict[str, np.ndarray]:
         """Extract volumetric cells from a library-specific mesh.
 
         Adapters that support volumetric meshes (VOLUMETRIC_MESH capability)
@@ -358,7 +371,7 @@ class MeshAdapter(ABC):
         """
         return {}
 
-    def to_canonical(self, mesh: Any, mesh_id: str = "") -> 'MeshInput':
+    def to_canonical(self, mesh: TMesh, mesh_id: str = "") -> 'MeshInput':
         """Convert library mesh to canonical format.
 
         This default implementation creates a MeshInput from vertices,
@@ -385,7 +398,7 @@ class MeshAdapter(ABC):
             volume_cells=volume_cells if volume_cells else None,
         )
 
-    def from_canonical(self, mesh_input: 'MeshInput') -> Any:
+    def from_canonical(self, mesh_input: 'MeshInput') -> TMesh:
         """Create library mesh from canonical format.
         
         This default implementation handles surface meshes. Adapters
@@ -415,7 +428,7 @@ class MeshAdapter(ABC):
 
     def compute_all_quality_metrics(
         self,
-        mesh: Any,
+        mesh: TMesh,
         metrics: Optional[List[str]] = None
     ) -> Dict[str, np.ndarray]:
         """Compute multiple quality metrics at once.

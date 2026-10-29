@@ -7,12 +7,16 @@ file loading/saving and delegates processing to PyVista when needed.
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, TYPE_CHECKING
 
 import numpy as np
 
 from .base_adapter import MeshAdapter
 from .exceptions import QualityMetricError, FileIOError, MeshConversionError
+
+if TYPE_CHECKING:
+    import meshio
+    from ..core.models import MeshInput
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +81,7 @@ def _meshio_type_supported(meshio_type: str, width: int) -> bool:
     return _MESHIO_TYPE_SUPPORT[meshio_type]
 
 
-class MeshioAdapter(MeshAdapter):
+class MeshioAdapter(MeshAdapter['meshio.Mesh']):
     """
     Adapter for the meshio library.
 
@@ -181,7 +185,7 @@ class MeshioAdapter(MeshAdapter):
             cells=cells
         )
 
-    def from_canonical(self, mesh_input) -> 'meshio.Mesh':
+    def from_canonical(self, mesh_input: 'MeshInput') -> 'meshio.Mesh':
         """
         Create meshio mesh from canonical format.
 

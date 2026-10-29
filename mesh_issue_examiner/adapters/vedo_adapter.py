@@ -7,17 +7,21 @@ and point clouds with support for jupyter notebooks.
 """
 
 import logging
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, Union, TYPE_CHECKING
 
 import numpy as np
 
 from .base_adapter import MeshAdapter
 from .exceptions import QualityMetricError, FileIOError, MeshConversionError
 
+if TYPE_CHECKING:
+    import vedo
+    from ..core.models import MeshInput
+
 logger = logging.getLogger(__name__)
 
 
-class VedoAdapter(MeshAdapter):
+class VedoAdapter(MeshAdapter['Union[vedo.Mesh, vedo.UnstructuredGrid]']):
     """
     Adapter for the vedo library.
 
@@ -112,7 +116,10 @@ class VedoAdapter(MeshAdapter):
         # vedo.Mesh expects vertices and faces
         return vedo.Mesh([vertices, faces])
 
-    def from_canonical(self, mesh_input: 'MeshInput') -> Any:
+    def from_canonical(
+        self,
+        mesh_input: 'MeshInput'
+    ) -> 'Union[vedo.Mesh, vedo.UnstructuredGrid]':
         """
         Create vedo mesh from canonical format.
 
@@ -215,7 +222,10 @@ class VedoAdapter(MeshAdapter):
             return np.array(mesh.faces)
         return np.array([])
 
-    def get_volume_cells(self, mesh: Any) -> Dict[str, np.ndarray]:
+    def get_volume_cells(
+        self,
+        mesh: 'Union[vedo.Mesh, vedo.UnstructuredGrid]'
+    ) -> Dict[str, np.ndarray]:
         """Extract volumetric cells from vedo UGrid.
         
         Args:
@@ -463,7 +473,7 @@ class VedoAdapter(MeshAdapter):
 
     def _compute_volumetric_quality(
         self,
-        mesh: Any,
+        mesh: 'Union[vedo.Mesh, vedo.UnstructuredGrid]',
         quality_type: str
     ) -> np.ndarray:
         """Compute volumetric cell quality via PyVista with caching."""

@@ -2,7 +2,7 @@
 TRimesh library adapter implementation.
 """
 
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, TYPE_CHECKING
 import logging
 
 import numpy as np
@@ -10,10 +10,14 @@ import numpy as np
 from .base_adapter import MeshAdapter
 from .exceptions import QualityMetricError, MeshConversionError
 
+if TYPE_CHECKING:
+    import trimesh
+    from ..core.models import MeshInput
+
 logger = logging.getLogger(__name__)
 
 
-class TrimeshAdapter(MeshAdapter):
+class TrimeshAdapter(MeshAdapter['trimesh.Trimesh']):
     """
     Adapter for the TRimesh library.
 

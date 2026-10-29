@@ -8,12 +8,16 @@ volumetric (UnstructuredGrid) meshes.
 """
 
 import logging
-from typing import Any, Dict, List, Tuple, Optional, Union
+from typing import Any, Dict, List, Tuple, Optional, Union, TYPE_CHECKING
 
 import numpy as np
 
 from .base_adapter import MeshAdapter
 from .exceptions import QualityMetricError, FileIOError, MeshConversionError
+
+if TYPE_CHECKING:
+    import pyvista
+    from ..core.models import MeshInput
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +41,7 @@ def _fan_triangulate(face_arrays: np.ndarray) -> np.ndarray:
     return np.array(tris, dtype=np.int64)
 
 
-class PyVistaAdapter(MeshAdapter):
+class PyVistaAdapter(MeshAdapter['Union[pyvista.PolyData, pyvista.UnstructuredGrid]']):
     """
     Adapter for the PyVista library (VTK wrapper).
 
@@ -125,7 +129,7 @@ class PyVistaAdapter(MeshAdapter):
         import pyvista
         return pyvista
 
-    def load_mesh(self, file_path: str, **kwargs) -> 'pyvista.PolyData':
+    def load_mesh(self, file_path: str, **kwargs) -> 'Union[pyvista.PolyData, pyvista.UnstructuredGrid]':
         """Load mesh from file using PyVista.
         
         Supports all VTK-based formats including:
@@ -268,7 +272,10 @@ class PyVistaAdapter(MeshAdapter):
         
         return pv.PolyData(mesh_input.vertices, face_arr, force_float=False)
 
-    def get_vertices(self, mesh: 'pyvista.PolyData') -> np.ndarray:
+    def get_vertices(
+        self,
+        mesh: 'Union[pyvista.PolyData, pyvista.UnstructuredGrid]'
+    ) -> np.ndarray:
         """Extract vertex array.
         
         Args:
@@ -279,7 +286,10 @@ class PyVistaAdapter(MeshAdapter):
         """
         return np.array(mesh.points)
 
-    def get_volume_cells(self, mesh: Any) -> Dict[str, np.ndarray]:
+    def get_volume_cells(
+        self,
+        mesh: 'Union[pyvista.PolyData, pyvista.UnstructuredGrid]'
+    ) -> Dict[str, np.ndarray]:
         """Extract volumetric cells from a PyVista UnstructuredGrid."""
         import pyvista as pv
         from ..utils.cell_types import get_vtk_type_to_name
@@ -301,7 +311,11 @@ class PyVistaAdapter(MeshAdapter):
 
         return {k: np.array(v) for k, v in cells_by_type.items()} if cells_by_type else {}
 
-    def to_canonical(self, mesh: Any, mesh_id: str = "") -> 'MeshInput':
+    def to_canonical(
+        self,
+        mesh: 'Union[pyvista.PolyData, pyvista.UnstructuredGrid]',
+        mesh_id: str = ""
+    ) -> 'MeshInput':
         """Convert PyVista mesh to canonical MeshInput format.
 
         Handles both PolyData (surface) and UnstructuredGrid (volumetric).
@@ -344,7 +358,10 @@ class PyVistaAdapter(MeshAdapter):
     # Maximum reasonable vertices per face to prevent issues with malformed data
     _MAX_VERTS_PER_FACE = 1000
 
-    def get_faces(self, mesh: 'pyvista.PolyData') -> np.ndarray:
+    def get_faces(
+        self,
+        mesh: 'Union[pyvista.PolyData, pyvista.UnstructuredGrid]'
+    ) -> np.ndarray:
         """Extract face array (removing vertex count prefix).
         
         Handles mixed face types (triangles, quads, polygons) by returning
@@ -413,7 +430,10 @@ class PyVistaAdapter(MeshAdapter):
             logger.debug(f"Mixed face sizes detected: {face_sizes}")
             return np.array([np.array(face, dtype=np.int64) for face in face_list], dtype=object)
 
-    def is_watertight(self, mesh: 'pyvista.PolyData') -> bool:
+    def is_watertight(
+        self,
+        mesh: 'Union[pyvista.PolyData, pyvista.UnstructuredGrid]'
+    ) -> bool:
         """Check if mesh is watertight.
         
         A mesh is watertight if it has no boundary (open) edges.
@@ -427,7 +447,10 @@ class PyVistaAdapter(MeshAdapter):
         # A mesh is watertight if it has no open edges
         return mesh.n_open_edges == 0
 
-    def is_manifold(self, mesh: 'pyvista.PolyData') -> Tuple[bool, List[Dict[str, Any]]]:
+    def is_manifold(
+        self,
+        mesh: 'Union[pyvista.PolyData, pyvista.UnstructuredGrid]'
+    ) -> Tuple[bool, List[Dict[str, Any]]]:
         """Check if mesh is manifold using VTK filters.
         
         Args:
@@ -461,7 +484,10 @@ class PyVistaAdapter(MeshAdapter):
 
         return len(issues) == 0, issues
 
-    def get_boundary_edges(self, mesh: 'pyvista.PolyData') -> np.ndarray:
+    def get_boundary_edges(
+        self,
+        mesh: 'Union[pyvista.PolyData, pyvista.UnstructuredGrid]'
+    ) -> np.ndarray:
         """Get boundary edges.
         
         Boundary edges are edges that belong to only one face.
@@ -485,7 +511,10 @@ class PyVistaAdapter(MeshAdapter):
             logger.debug(f"Could not extract boundary edges: {e}")
         return np.array([])
 
-    def get_nonmanifold_edges(self, mesh: 'pyvista.PolyData') -> List[Tuple[int, int, int]]:
+    def get_nonmanifold_edges(
+        self,
+        mesh: 'Union[pyvista.PolyData, pyvista.UnstructuredGrid]'
+    ) -> List[Tuple[int, int, int]]:
         """Detect non-manifold edges.
         
         Non-manifold edges are edges shared by more than 2 faces.
@@ -527,7 +556,7 @@ class PyVistaAdapter(MeshAdapter):
 
     def get_duplicate_vertices(
         self,
-        mesh: 'pyvista.PolyData',
+        mesh: 'Union[pyvista.PolyData, pyvista.UnstructuredGrid]',
         tolerance: float
     ) -> List[int]:
         """Find duplicate vertices.
@@ -553,7 +582,10 @@ class PyVistaAdapter(MeshAdapter):
             logger.debug(f"Could not find duplicate vertices: {e}")
             return []
 
-    def compute_face_areas(self, mesh: 'pyvista.PolyData') -> np.ndarray:
+    def compute_face_areas(
+        self,
+        mesh: 'Union[pyvista.PolyData, pyvista.UnstructuredGrid]'
+    ) -> np.ndarray:
         """Compute area of each face.
         
         Uses VTK's cell quality filter if available, falls back to
@@ -573,7 +605,10 @@ class PyVistaAdapter(MeshAdapter):
             # Fallback to manual computation
             return self._compute_areas_manual(mesh)
 
-    def _compute_areas_manual(self, mesh: 'pyvista.PolyData') -> np.ndarray:
+    def _compute_areas_manual(
+        self,
+        mesh: 'Union[pyvista.PolyData, pyvista.UnstructuredGrid]'
+    ) -> np.ndarray:
         """Manually compute face areas.
         
         Args:
@@ -604,7 +639,10 @@ class PyVistaAdapter(MeshAdapter):
 
         return areas
 
-    def compute_face_normals(self, mesh: 'pyvista.PolyData') -> np.ndarray:
+    def compute_face_normals(
+        self,
+        mesh: 'Union[pyvista.PolyData, pyvista.UnstructuredGrid]'
+    ) -> np.ndarray:
         """Compute face normals.
         
         Uses VTK's normal computation if available, falls back to
@@ -627,7 +665,10 @@ class PyVistaAdapter(MeshAdapter):
             logger.debug(f"VTK normal computation failed, using manual: {e}")
             return self._compute_normals_manual(mesh)
 
-    def _compute_normals_manual(self, mesh: 'pyvista.PolyData') -> np.ndarray:
+    def _compute_normals_manual(
+        self,
+        mesh: 'Union[pyvista.PolyData, pyvista.UnstructuredGrid]'
+    ) -> np.ndarray:
         """Manually compute face normals."""
         faces = self.get_faces(mesh)
         vertices = self.get_vertices(mesh)
@@ -654,7 +695,7 @@ class PyVistaAdapter(MeshAdapter):
 
     def detect_self_intersections(
         self,
-        mesh: 'pyvista.PolyData',
+        mesh: 'Union[pyvista.PolyData, pyvista.UnstructuredGrid]',
         method: str = 'manual',
         tolerance: float = 1e-10
     ) -> List[Tuple[int, int]]:
@@ -689,7 +730,7 @@ class PyVistaAdapter(MeshAdapter):
 
     def _detect_self_intersections_manual(
         self,
-        mesh: 'pyvista.PolyData',
+        mesh: 'Union[pyvista.PolyData, pyvista.UnstructuredGrid]',
         tolerance: float = 1e-10
     ) -> List[Tuple[int, int]]:
         """Manual self-intersection detection using Möller-Trumbore algorithm.
@@ -733,7 +774,7 @@ class PyVistaAdapter(MeshAdapter):
 
     def _detect_self_intersections_pymeshfix(
         self,
-        mesh: 'pyvista.PolyData'
+        mesh: 'Union[pyvista.PolyData, pyvista.UnstructuredGrid]'
     ) -> List[Tuple[int, int]]:
         """Self-intersection detection using pymeshfix (legacy method).
         
@@ -795,7 +836,7 @@ class PyVistaAdapter(MeshAdapter):
 
     def compute_cell_quality(
         self,
-        mesh: 'pyvista.PolyData',
+        mesh: 'Union[pyvista.PolyData, pyvista.UnstructuredGrid]',
         quality_type: str
     ) -> np.ndarray:
         """Compute cell quality metrics using VTK's cell quality filter.

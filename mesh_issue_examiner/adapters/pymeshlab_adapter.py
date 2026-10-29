@@ -4,17 +4,21 @@ PyMeshLab library adapter implementation.
 
 import logging
 import warnings
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, TYPE_CHECKING
 
 import numpy as np
 
 from .base_adapter import MeshAdapter
 from .exceptions import QualityMetricError, FileIOError, MeshConversionError
 
+if TYPE_CHECKING:
+    import pymeshlab
+    from ..core.models import MeshInput
+
 logger = logging.getLogger(__name__)
 
 
-class PyMeshLabAdapter(MeshAdapter):
+class PyMeshLabAdapter(MeshAdapter['pymeshlab.MeshSet']):
     """
     Adapter for the PyMeshLab library.
 
