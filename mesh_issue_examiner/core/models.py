@@ -5,11 +5,15 @@ This module defines the core data structures used throughout the framework
 for representing meshes, issues, and quality metrics in a canonical format.
 """
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Dict, Optional, Any, Tuple, Union
 from pathlib import Path
+import os
 import threading
+import weakref
+
 import numpy as np
 
 
@@ -252,6 +256,90 @@ class OperationConfig:
         }
 
 
+# ---------------------------------------------------------------------------
+# Process-wide native-object cache tracker
+# ---------------------------------------------------------------------------
+# Each MeshInput may memoize up to MeshInput._MAX_CACHE_SIZE native
+# (library-specific) mesh objects; across many long-lived meshes those
+# per-instance caches add up unboundedly. This module-level LRU tracker
+# bounds the AGGREGATE number of cached native objects (audit item 2.4).
+#
+# Cleanup is weakref-based: the tracker maps ``id(mesh)`` to
+# ``weakref.ref(mesh, callback)``. When a tracked mesh is garbage-collected
+# the callback fires and removes the dead entry under
+# ``_global_mesh_lru_lock``, so the tracker never keeps a MeshInput alive
+# and never leaks entries for meshes that are gone.
+_global_mesh_lru: 'OrderedDict[int, weakref.ref]' = OrderedDict()
+_global_mesh_lru_lock = threading.Lock()
+
+# Sentinel distinguishing "not cached yet" from a cached None value.
+_CACHED_NATIVE_MISS = object()
+
+
+def _default_global_cache_limit() -> int:
+    """Read the aggregate native-cache limit from the environment.
+
+    Called once at module import to initialize
+    :attr:`MeshInput.GLOBAL_CACHE_LIMIT`.
+
+    Returns:
+        Value of ``MESH_EXAMINER_GLOBAL_CACHE_LIMIT`` clamped to a minimum
+        of 1, or 64 when unset or not a valid integer.
+    """
+    raw = os.environ.get('MESH_EXAMINER_GLOBAL_CACHE_LIMIT', '64')
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return 64
+
+
+def _touch_global_lru(mesh_key: int):
+    """Mark a tracked mesh as most-recently-used in the global LRU.
+
+    Args:
+        mesh_key: ``id()`` of the mesh being accessed.
+    """
+    with _global_mesh_lru_lock:
+        if mesh_key in _global_mesh_lru:
+            _global_mesh_lru.move_to_end(mesh_key)
+
+
+def _enforce_global_native_cache_limit(exclude_key: int):
+    """Evict cached native objects until the aggregate total is in bounds.
+
+    While the sum of cached native objects across all live tracked meshes
+    exceeds :attr:`MeshInput.GLOBAL_CACHE_LIMIT`, the least-recently-used
+    live mesh (other than ``exclude_key``) has its cache invalidated via
+    :meth:`MeshInput.invalidate_cache`. Meshes with no cached objects are
+    skipped as victims (invalidating them cannot reduce the total). The
+    loop also breaks without touching ``exclude_key`` when it is the only
+    eligible entry left, avoiding a livelock against the caller that is
+    currently populating it.
+
+    Must be called WITHOUT the calling mesh's instance lock held, because
+    eviction acquires other meshes' instance locks.
+
+    Args:
+        exclude_key: ``id()`` of the mesh currently constructing a native
+            object; it is never chosen as the eviction victim.
+    """
+    with _global_mesh_lru_lock:
+        while True:
+            total = 0
+            victim = None
+            for key, ref in _global_mesh_lru.items():
+                mesh = ref()
+                if mesh is None:
+                    continue  # dead entry; weakref callback will remove it
+                count = len(mesh._native_objects)
+                total += count
+                if victim is None and count > 0 and key != exclude_key:
+                    victim = mesh  # first (LRU-oldest) eligible mesh
+            if total <= MeshInput.GLOBAL_CACHE_LIMIT or victim is None:
+                return
+            victim.invalidate_cache()
+
+
 class MeshInput:
     """
     Canonical mesh representation for MCP operations.
@@ -283,6 +371,11 @@ class MeshInput:
     """
 
     _MAX_CACHE_SIZE = 8
+
+    # Aggregate bound on cached native objects across ALL live tracked
+    # meshes (see ``_global_mesh_lru`` above). Read once at module import
+    # from MESH_EXAMINER_GLOBAL_CACHE_LIMIT (minimum 1).
+    GLOBAL_CACHE_LIMIT = _default_global_cache_limit()
 
     def __init__(
         self,
@@ -319,6 +412,19 @@ class MeshInput:
         if cell_materials is not None:
             self._cell_materials = np.array(cell_materials) if not isinstance(cell_materials, np.ndarray) else cell_materials
         self._material_names: Optional[Dict[int, str]] = material_names
+
+        # Track this mesh in the process-wide native-object LRU. The
+        # weakref callback removes our entry as soon as this mesh is
+        # garbage-collected, so the tracker only ever references live
+        # meshes and never prolongs their lifetime.
+        mesh_key = id(self)
+
+        def _drop_from_lru(_dead_ref, key=mesh_key):
+            with _global_mesh_lru_lock:
+                _global_mesh_lru.pop(key, None)
+
+        with _global_mesh_lru_lock:
+            _global_mesh_lru[mesh_key] = weakref.ref(self, _drop_from_lru)
 
     @property
     def vertices(self) -> np.ndarray:
@@ -479,19 +585,39 @@ class MeshInput:
         Uses double-checked locking for thread safety: the outer check
         avoids acquiring the lock on the hot path (already-cached), while
         the inner check prevents redundant construction when multiple
-        threads pass the outer check simultaneously.
+        threads pass the outer check simultaneously. The object is bound
+        to a local before the lock is released so a concurrent
+        invalidate_cache() cannot race the final lookup.
+
+        Every call refreshes this mesh's position in the process-wide
+        native-object LRU tracker; when a fresh construction pushes the
+        aggregate over :attr:`GLOBAL_CACHE_LIMIT`, the least-recently-used
+        other live mesh has its cache evicted (see
+        ``_enforce_global_native_cache_limit``).
         """
         caching = getattr(self, '_caching_enabled', True)
-        if caching:
-            if library not in self._native_objects:
-                with self._lock:
-                    if library not in self._native_objects:
-                        self._construct_native(library)
-            return self._native_objects[library]
-        # Bypass cache: construct fresh object without storing it
-        from ..adapters.factory import get_adapter
-        adapter = get_adapter(library)
-        return adapter.from_canonical(self)
+        if not caching:
+            # Bypass cache: construct fresh object without storing it
+            from ..adapters.factory import get_adapter
+            adapter = get_adapter(library)
+            return adapter.from_canonical(self)
+
+        obj = self._native_objects.get(library, _CACHED_NATIVE_MISS)
+        if obj is not _CACHED_NATIVE_MISS:
+            _touch_global_lru(id(self))
+            return obj
+        with self._lock:
+            # Double-checked: another thread may have constructed the
+            # object while this one waited for the lock.
+            obj = self._native_objects.get(library, _CACHED_NATIVE_MISS)
+            if obj is _CACHED_NATIVE_MISS:
+                self._construct_native(library)
+                obj = self._native_objects.get(library, _CACHED_NATIVE_MISS)
+        # Enforce the aggregate bound outside self._lock: eviction may
+        # invalidate other meshes' caches (acquiring their locks).
+        _enforce_global_native_cache_limit(id(self))
+        _touch_global_lru(id(self))
+        return obj
 
     def _construct_native(self, library: str):
         """Construct library-specific mesh object via the adapter factory."""
@@ -502,6 +628,35 @@ class MeshInput:
         while len(self._native_objects) > self._MAX_CACHE_SIZE:
             oldest_key = next(iter(self._native_objects))
             del self._native_objects[oldest_key]
+
+    def get_edge_face_adjacency(self) -> Dict[Tuple[int, int], List[int]]:
+        """Return the edge-to-incident-faces adjacency map, memoized.
+
+        Computed once via ``utils.topology.build_edge_face_map`` and
+        memoized in ``self._adjacency_cache['edge_face']`` using the same
+        double-checked-locking pattern as :meth:`get_native`. Any
+        cache-invalidating mutation (e.g. the ``faces`` setter or
+        :meth:`invalidate_cache`) drops the memoized entry so the next
+        call recomputes it from the new connectivity.
+
+        The ``build_edge_face_map`` import is deferred into the method
+        body to avoid import cycles between ``core.models`` and
+        ``utils.topology`` consumers.
+
+        Returns:
+            Dict mapping canonical (sorted) ``(v1, v2)`` edge tuples to
+            the list of face indices incident to that edge.
+        """
+        obj = self._adjacency_cache.get('edge_face')
+        if obj is not None:
+            return obj
+        with self._lock:
+            obj = self._adjacency_cache.get('edge_face')
+            if obj is None:
+                from ..utils.topology import build_edge_face_map
+                obj = build_edge_face_map(self._faces)
+                self._adjacency_cache['edge_face'] = obj
+        return obj
 
     def invalidate_cache(self):
         """Clear cached data when mesh is modified."""

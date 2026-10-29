@@ -191,6 +191,12 @@ class OperationRegistry:
             start_time = time.perf_counter()
 
             for operation in operations:
+                # Prime the mesh's memoized edge-face adjacency so all
+                # adjacency-hungry operations in this workflow share ONE
+                # adjacency computation (MeshInput memoizes the map, so
+                # repeated priming calls are cheap after the first).
+                if operation.metadata.requires_adjacency:
+                    mesh.get_edge_face_adjacency()
                 issues = operation.run(mesh, config=config)
                 result.issues.extend(issues)
                 # Surface quality metric distributions computed by the
@@ -282,3 +288,27 @@ class OperationRegistry:
 # concrete operations at import time (e.g. registry.register(MyOp()).
 # For the lazy accessor used by base.register_operation(), see _registry.py.
 registry = OperationRegistry()
+
+
+def reset_registry() -> OperationRegistry:
+    """Reset the global operation registry (primarily for tests).
+
+    Creates a fresh :class:`OperationRegistry`, rebinds the module-level
+    ``registry`` name to it, and clears the cached singleton used by
+    :func:`mesh_issue_examiner.operations.base.register_operation` so
+    subsequent registrations resolve to the new instance.
+
+    Operations registered with the previous registry are NOT carried
+    over. Built-in operations re-register when their modules are
+    re-imported (e.g. via ``importlib.reload`` of the operation
+    subpackage), so the full built-in surface can be rebuilt after a
+    reset.
+
+    Returns:
+        The newly created (empty) registry instance.
+    """
+    global registry
+    from . import _registry as _registry_module
+    registry = OperationRegistry()
+    _registry_module._clear_cache()
+    return registry

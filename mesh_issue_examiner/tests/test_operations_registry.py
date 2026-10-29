@@ -2,8 +2,12 @@
 Comprehensive unit tests for operations/base.py and operations/operation_registry.py.
 
 Tests OperationMetadata, BaseOperation, QualityOperation, OperationError,
-module-level registry functions, OperationCategory, and OperationRegistry.
+module-level registry functions, OperationCategory, OperationRegistry,
+workflow adjacency priming, reset_registry, and registry injection into
+MeshIssueExaminerServer.
 """
+
+import asyncio
 
 import pytest
 import numpy as np
@@ -17,6 +21,9 @@ from mesh_issue_examiner.core.models import (
     OperationConfig,
     InspectionResult,
 )
+from mesh_issue_examiner.mcp.server import MCPRequest, MeshIssueExaminerServer
+from mesh_issue_examiner.operations import _registry as _registry_module
+from mesh_issue_examiner.operations import operation_registry as operation_registry_module
 from mesh_issue_examiner.operations.base import (
     BaseOperation,
     OperationMetadata,
@@ -26,7 +33,11 @@ from mesh_issue_examiner.operations.base import (
     register_operation,
     _register_decorator,
 )
-from mesh_issue_examiner.operations.operation_registry import OperationRegistry, OperationCategory
+from mesh_issue_examiner.operations.operation_registry import (
+    OperationRegistry,
+    OperationCategory,
+    reset_registry,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -51,12 +62,14 @@ class MockOperation(BaseOperation):
         tags=None,
         libraries=None,
         config=None,
+        requires_adjacency=False,
     ):
         super().__init__(config=config)
         self._op_id = op_id
         self._category = category
         self._tags = tags or ["test"]
         self._libraries = libraries or ["trimesh"]
+        self._requires_adjacency = requires_adjacency
 
     @property
     def metadata(self):
@@ -67,6 +80,7 @@ class MockOperation(BaseOperation):
             category=self._category,
             supported_libraries=self._libraries,
             recommended_library=self._libraries[0],
+            requires_adjacency=self._requires_adjacency,
             tags=self._tags,
         )
 
@@ -680,3 +694,155 @@ class TestOperationRegistryFresh:
             cat_obj = reg.get_by_category(cat)
             assert isinstance(cat_obj, OperationCategory)
             assert cat_obj.name == cat.value
+
+
+# ===================================================================
+# Part 3: workflow adjacency priming (audit 3.3)
+# ===================================================================
+
+
+class AdjacencyRecordingOperation(MockOperation):
+    """MockOperation recording whether adjacency was primed at execute()."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.adjacency_seen = None
+
+    def execute(self, mesh):
+        self.adjacency_seen = mesh._adjacency_cache.get("edge_face")
+        return []
+
+
+class TestWorkflowAdjacencyPriming:
+    """create_workflow must prime adjacency for requires_adjacency ops."""
+
+    def test_requires_adjacency_primes_before_run(self):
+        reg = OperationRegistry()
+        op = AdjacencyRecordingOperation(
+            op_id="adj.needs", requires_adjacency=True
+        )
+        reg.register(op)
+        mesh = _make_mesh()
+
+        result = reg.create_workflow(["adj.needs"])(mesh)
+
+        assert isinstance(result, InspectionResult)
+        # Adjacency was available BEFORE execute() ran.
+        assert op.adjacency_seen is not None
+        assert op.adjacency_seen is mesh.get_edge_face_adjacency()
+
+    def test_no_adjacency_flag_does_not_prime(self):
+        reg = OperationRegistry()
+        op = AdjacencyRecordingOperation(
+            op_id="adj.skip", requires_adjacency=False
+        )
+        reg.register(op)
+        mesh = _make_mesh()
+
+        reg.create_workflow(["adj.skip"])(mesh)
+
+        assert op.adjacency_seen is None
+
+    def test_adjacency_shared_across_multiple_hungry_ops(self):
+        """Multiple adjacency-hungry ops see the SAME memoized map."""
+        reg = OperationRegistry()
+        op1 = AdjacencyRecordingOperation(
+            op_id="adj.one", requires_adjacency=True
+        )
+        op2 = AdjacencyRecordingOperation(
+            op_id="adj.two", requires_adjacency=True
+        )
+        reg.register(op1)
+        reg.register(op2)
+        mesh = _make_mesh()
+
+        reg.create_workflow(["adj.one", "adj.two"])(mesh)
+
+        assert op1.adjacency_seen is not None
+        assert op1.adjacency_seen is op2.adjacency_seen
+
+
+# ===================================================================
+# Part 4: reset_registry (audit 3.1)
+# ===================================================================
+
+
+class TestResetRegistry:
+    """reset_registry swaps in a fresh global registry and re-resolves
+    the lazy accessor. The original global is restored afterwards so
+    other tests in the session keep the built-in operations."""
+
+    def test_reset_rebinds_global_and_lazy_accessor(self):
+        old = operation_registry_module.registry
+        try:
+            new = reset_registry()
+
+            assert isinstance(new, OperationRegistry)
+            assert new is not old
+            assert operation_registry_module.registry is new
+            # Lazy accessor (used by base.register_operation) re-resolves.
+            assert get_registry() is new
+            assert _registry_module.get_registry() is new
+            # Fresh registry starts empty; old instance is untouched.
+            assert len(new) == 0
+            assert "mock.op" not in old  # sanity: old still usable
+
+            # New registrations land in the new registry only.
+            register_operation(MockOperation(op_id="reset.op"))
+            assert "reset.op" in new
+            assert "reset.op" not in old
+
+            # Servers constructed afterwards pick up the new registry.
+            server = MeshIssueExaminerServer(auto_register_operations=False)
+            assert server.registry is new
+        finally:
+            operation_registry_module.registry = old
+            _registry_module._clear_cache()
+        assert get_registry() is old
+        assert operation_registry_module.registry is old
+
+
+# ===================================================================
+# Part 5: registry injection into MeshIssueExaminerServer (audit 3.1)
+# ===================================================================
+
+
+class TestMeshIssueExaminerServerRegistryInjection:
+    """MeshIssueExaminerServer must honor an injected registry."""
+
+    def test_default_registry_is_current_global(self):
+        server = MeshIssueExaminerServer(auto_register_operations=False)
+        assert server.registry is operation_registry_module.registry
+
+    def test_injected_registry_used_for_inspect(self):
+        reg = OperationRegistry()
+        reg.register(MockOperation(op_id="injected.op"))
+        server = MeshIssueExaminerServer(
+            auto_register_operations=False, registry=reg
+        )
+        assert server.registry is reg
+        assert server.registry is not operation_registry_module.registry
+
+        server._mesh_cache["m"] = _make_mesh()
+        req = MCPRequest(
+            method="mesh_inspect",
+            params={"mesh_id": "m", "operations": ["injected.op"]},
+        )
+        resp = asyncio.run(server.handle_request(req))
+        assert resp.error is None
+        assert resp.result["summary"]["total_issues"] == 0
+
+    def test_injected_registry_unknown_operation_rejected(self):
+        """Validation runs against the injected registry, not the global."""
+        reg = OperationRegistry()  # empty: knows no built-in ids
+        server = MeshIssueExaminerServer(
+            auto_register_operations=False, registry=reg
+        )
+        server._mesh_cache["m"] = _make_mesh()
+        req = MCPRequest(
+            method="mesh_inspect",
+            params={"mesh_id": "m", "operations": ["no.such.op"]},
+        )
+        resp = asyncio.run(server.handle_request(req))
+        assert resp.error is not None
+        assert "Unknown operation" in resp.error["message"]

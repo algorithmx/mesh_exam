@@ -838,3 +838,53 @@ class TestMeshInput:
         # we test caching by inserting a fake value.
         mesh._native_objects["fake"] = "cached_obj"
         assert mesh.get_native("fake") == "cached_obj"
+
+
+class TestMeshInputEdgeFaceAdjacency:
+    """Tests for MeshInput.get_edge_face_adjacency (audit 3.3)."""
+
+    UNIT_CUBE_VERTS = TestMeshInput.UNIT_CUBE_VERTS
+    UNIT_CUBE_FACES = TestMeshInput.UNIT_CUBE_FACES
+
+    def test_matches_build_edge_face_map(self):
+        """The memoized map equals utils.topology.build_edge_face_map."""
+        from mesh_issue_examiner.utils.topology import build_edge_face_map
+
+        mesh = MeshInput(self.UNIT_CUBE_VERTS, self.UNIT_CUBE_FACES,
+                         mesh_id="cube")
+        adj = mesh.get_edge_face_adjacency()
+        assert adj == build_edge_face_map(self.UNIT_CUBE_FACES)
+        # Closed cube surface: 18 unique edges, each incident to 2 faces.
+        assert len(adj) == 18
+        assert all(len(faces) == 2 for faces in adj.values())
+
+    def test_memoized_same_object(self):
+        """Repeated calls return the identical memoized dict."""
+        mesh = MeshInput(self.UNIT_CUBE_VERTS, self.UNIT_CUBE_FACES,
+                         mesh_id="cube")
+        adj1 = mesh.get_edge_face_adjacency()
+        adj2 = mesh.get_edge_face_adjacency()
+        assert adj1 is adj2
+        assert mesh._adjacency_cache["edge_face"] is adj1
+
+    def test_faces_setter_invalidates(self):
+        """Mutating faces drops the memoized entry and recomputes."""
+        mesh = MeshInput(self.UNIT_CUBE_VERTS, self.UNIT_CUBE_FACES,
+                         mesh_id="cube")
+        adj1 = mesh.get_edge_face_adjacency()
+
+        mesh.faces = np.array([[0, 1, 2]])
+        assert "edge_face" not in mesh._adjacency_cache
+
+        adj2 = mesh.get_edge_face_adjacency()
+        assert adj2 is not adj1
+        assert set(adj2) == {(0, 1), (0, 2), (1, 2)}
+
+    def test_invalidate_cache_clears_adjacency(self):
+        """invalidate_cache() drops the memoized adjacency entry."""
+        mesh = MeshInput(self.UNIT_CUBE_VERTS, self.UNIT_CUBE_FACES,
+                         mesh_id="cube")
+        mesh.get_edge_face_adjacency()
+        assert "edge_face" in mesh._adjacency_cache
+        mesh.invalidate_cache()
+        assert "edge_face" not in mesh._adjacency_cache

@@ -31,7 +31,7 @@ from ..core.models import (
     IssueCategory,
     IssueSeverity,
 )
-from ..operations.operation_registry import registry
+from ..operations.operation_registry import OperationRegistry, registry
 from ..utils.mesh_loader import load_mesh_from_file, save_mesh_to_file
 
 logger = logging.getLogger(__name__)
@@ -130,6 +130,7 @@ class MeshIssueExaminerServer:
         auto_register_operations: bool = True,
         enable_save_tool: bool = False,
         allowed_save_dirs: Optional[List[Union[str, Path]]] = None,
+        registry: Optional[OperationRegistry] = None,
     ):
         """
         Initialize the MCP server.
@@ -146,7 +147,16 @@ class MeshIssueExaminerServer:
             allowed_save_dirs: Optional list of directories ``mesh_save``
                 may write into. When provided, an output_path that does
                 not resolve under one of these directories is rejected.
+            registry: Optional :class:`OperationRegistry` used by
+                :meth:`_handle_inspect`. Defaults to the current global
+                registry (``operations.operation_registry.registry``).
         """
+        if registry is None:
+            # Resolve the *current* global registry (not the import-time
+            # binding) so registry resets stay visible to new servers.
+            from ..operations import operation_registry as _operation_registry
+            registry = _operation_registry.registry
+        self.registry = registry
         self.config = config or OperationConfig()
         self._mesh_cache: Dict[str, MeshInput] = {}
         self._result_cache: Dict[str, InspectionResult] = {}
@@ -633,14 +643,14 @@ class MeshIssueExaminerServer:
         # Determine which operations to run
         if operations is not None:
             # Validate operation IDs against registry
-            available = {op.operation_id for op in registry.list_all()}
+            available = {op.operation_id for op in self.registry.list_all()}
             invalid = [o for o in operations if o not in available]
             if invalid:
                 raise ValueError(
                     f"Unknown operation(s): {', '.join(invalid)}. "
                     f"Discover IDs via the mesh://operations resource."
                 )
-            workflow = registry.create_workflow(operations, config=self.config)
+            workflow = self.registry.create_workflow(operations, config=self.config)
         elif categories is not None:
             # Build workflow from categories
             op_ids = []
@@ -648,12 +658,12 @@ class MeshIssueExaminerServer:
                 cat = IssueCategory(c)
                 op_ids.extend(
                     op.operation_id
-                    for op in registry.list_by_category(cat)
+                    for op in self.registry.list_by_category(cat)
                 )
-            workflow = registry.create_workflow(op_ids, config=self.config)
+            workflow = self.registry.create_workflow(op_ids, config=self.config)
         else:
             # Default: run all operations
-            workflow = registry.create_full_workflow(config=self.config)
+            workflow = self.registry.create_full_workflow(config=self.config)
 
         start_time = time.perf_counter()
         result = workflow(mesh)
